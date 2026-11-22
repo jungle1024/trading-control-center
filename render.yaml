@@ -1,0 +1,29 @@
+# 통합 운영 대시보드 — Jones·Ross·Kell 과 별도 서비스(독립 배포).
+# DB는 공유 nss-collector-db: ptj_/rc_/kc_ 테이블은 읽기 전용 세션으로만 조회, 쓰기는 dash_ 테이블만.
+services:
+  - type: web
+    name: trading-control-center
+    runtime: python
+    plan: starter
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.0
+      - key: DATABASE_URL
+        fromDatabase:
+          name: nss-collector-db
+          property: connectionString
+      - key: DASH_PASSWORD        # 대시보드 로그인 비밀번호 — 자동 생성(대시보드 Environment에서 확인·변경)
+        generateValue: true
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: NTFY_TOPIC           # 통합 알림 토픽(P1·P2·일일보고) — 세 앱과 다른 이름 권장
+        sync: false
+      - key: ROSS_APP_PASSWORD    # (선택) 토스 실잔고 조회용 — Ross 웹앱 로그인 비밀번호
+        sync: false
+      - key: KELL_APP_PASSWORD    # (선택) 한국투자증권 실잔고 조회용 — Kell 웹앱 로그인 비밀번호
+        sync: false
