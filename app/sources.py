@@ -21,6 +21,8 @@ APPS = {
              "url": os.environ.get("ROSS_URL", "https://ross-cameron-scanner-zcc5.onrender.com"), "trading": True},
     "KELL": {"name": "올리버 켈", "short": "Kell", "role": "수축 돌파 수일 매매 · 한국투자증권",
              "url": os.environ.get("KELL_URL", "https://kell-contraction-breakout-c8tn.onrender.com"), "trading": True},
+    "MA": {"name": "20·60 이동평균선 추세", "short": "MA20·60", "role": "20·60일선·추세 저항선 돌파 · 키움증권",
+           "url": os.environ.get("MA_URL", "https://ma2060-trend-trader-x7oa.onrender.com"), "trading": True},
 }
 
 
@@ -47,7 +49,8 @@ async def probe_all() -> dict:
 _ACCT_CACHE: dict = {}
 
 
-async def _login_get(app: str, path: str) -> dict:
+async def _login_get(app: str, paths) -> dict:
+    """로그인 후 읽기 전용 GET 만 호출. paths: 문자열 하나 또는 {이름: 경로}."""
     pw = os.environ.get(f"{app}_APP_PASSWORD", "")
     if not pw:
         return {"configured": False}
@@ -55,23 +58,36 @@ async def _login_get(app: str, path: str) -> dict:
     async with httpx.AsyncClient(timeout=30, follow_redirects=False) as c:
         if app == "ROSS":
             r = await c.post(base + "/login", data={"pw": pw})
+        elif app == "MA":
+            r = await c.post(base + "/api/login", data={"pw": pw})
         else:
             r = await c.post(base + "/api/login", json={"password": pw})
         if r.status_code not in (200, 303):
             return {"configured": True, "ok": False, "err": f"로그인 실패 HTTP {r.status_code}"}
-        r = await c.get(base + path)
-        if r.status_code != 200:
-            return {"configured": True, "ok": False, "err": f"{path} HTTP {r.status_code}: {r.text[:160]}"}
-        return {"configured": True, "ok": True, "data": r.json(), "at": time.time()}
+        if isinstance(paths, str):
+            r = await c.get(base + paths)
+            if r.status_code != 200:
+                return {"configured": True, "ok": False, "err": f"{paths} HTTP {r.status_code}: {r.text[:160]}"}
+            return {"configured": True, "ok": True, "data": r.json(), "at": time.time()}
+        out, errs = {}, []
+        for name, path in paths.items():
+            r = await c.get(base + path)
+            if r.status_code == 200:
+                out[name] = r.json()
+            else:
+                errs.append(f"{path} HTTP {r.status_code}: {r.text[:120]}")
+        return {"configured": True, "ok": bool(out), "data": out, "err": " · ".join(errs) or None, "at": time.time()}
 
 
-async def accounts(max_age: int = 300) -> dict:
+async def accounts(max_age: int = 300, ma_book: str | None = None) -> dict:
     """증권사 실잔고 — 5분 캐시(증권사 API 부담 최소화)."""
     now = time.time()
     if _ACCT_CACHE.get("at") and now - _ACCT_CACHE["at"] < max_age:
         return _ACCT_CACHE["v"]
     out = {}
-    for app, path in (("ROSS", "/api/toss/account"), ("KELL", "/api/account")):
+    jobs = [("ROSS", "/api/toss/account"), ("KELL", "/api/account"),
+            ("MA", {"funds": "/api/broker/funds", **({"book": f"/api/paper?book={ma_book}"} if ma_book else {})})]
+    for app, path in jobs:
         try:
             out[app] = await _login_get(app, path)
         except Exception as e:
@@ -179,3 +195,43 @@ def kell() -> dict:
     return {"settings": st, "broker": peak, "engine": eng, "jobs": jobs, "market": mk[0] if mk else None, "watch": watch,
             "scan": scan[0] if scan else None, "pos_open": pos_open, "pos_closed": pos_closed, "orders": orders,
             "signals": sig, "shadow": shadow[0] if shadow else {}, "events": ev}
+
+
+def ma() -> dict:
+    st = {r["k"]: r["data"] for r in q("select k, data from mt_settings where k='main'")}
+    jobs = q("""(select id, job, started, finished, ok, as_of, left(error, 300) error, stats->'kinds' kinds, stats->'signals' signals,
+                        stats->'buyable' buyable, stats->'watch' watch, stats->'approval' approval
+                 from mt_jobs where job='nightly' order by id desc limit 6)
+                union all
+                (select id, job, started, finished, ok, as_of, left(error, 300) error, null, null, null, null, stats->'approval'
+                 from mt_jobs where job<>'nightly' order by id desc limit 3)
+                order by id desc""")
+    mk = q("select as_of, data from mt_market order by as_of desc limit 1")
+    sd = q("select max(as_of) d from mt_scan")
+    scan, fails = [], []
+    if sd and sd[0]["d"]:
+        scan = q("""select kind, count(*) n, count(*) filter (where signal) sig, count(*) filter (where buyable) buy
+                    from mt_scan where as_of=%s group by kind""", (sd[0]["d"],))
+        fails = q("""select f fail, count(*) n from mt_scan, jsonb_array_elements_text(coalesce(fails, '[]'::jsonb)) f
+                     where as_of=%s and kind in ('A','B','C') group by f order by n desc limit 6""", (sd[0]["d"],))
+    wd = q("select max(for_date) d from mt_watch")
+    watch = []
+    if wd and wd[0]["d"]:
+        watch = q("""select for_date, symbol, kind, level, entry_ref, chase_max, stop, target, rr, score, status, note
+                     from mt_watch where for_date=%s order by status='excluded', score desc nulls last""", (wd[0]["d"],))
+    pos_open = q("""select id, book, symbol, kind, opened_at, entry, qty, qty_open, stop0, stop, target, risk_ps, partial_done,
+                           exit_next_open, realized from mt_positions where status='open' order by opened_at""")
+    pos_closed = q("""select id, book, symbol, kind, opened_at, closed_at, entry, qty, realized, risk_ps, exit_why
+                      from mt_positions where status='closed' order by closed_at""")
+    orders = q("""select id, created, sent_at, env, symbol, side, kind, qty, price, status, reason from mt_orders
+                  where created > now() - interval '14 days' and status <> 'previewed' order by id desc limit 60""")
+    locks = q("select symbol, order_id, reason, created from mt_order_lock")
+    research = q("""select id, created, name, status, summary->'approval' approval from mt_research order by id desc limit 1""")
+    broker = q("""select at, msg from mt_events where kind='broker' order by id desc limit 1""")
+    errs = q("""select count(*) n, max(at) last from mt_events where kind in ('manage_error','error','order_rejected')
+                and at > now() - interval '24 hours'""")
+    protect = q("select count(*) n from mt_protect")
+    return {"settings": st.get("main") or {}, "jobs": jobs, "market": mk[0] if mk else None, "scan_as_of": sd[0]["d"] if sd else None,
+            "scan": scan, "fails": fails, "watch": watch, "pos_open": pos_open, "pos_closed": pos_closed, "orders": orders,
+            "locks": locks, "research": research[0] if research else None, "broker": broker[0] if broker else None,
+            "errs24": errs[0] if errs else {}, "protect_n": protect[0]["n"] if protect else 0}

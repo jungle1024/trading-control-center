@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import os
 import time
 from datetime import date, datetime, timedelta, timezone
 
@@ -97,9 +98,19 @@ class Ctx:
             self.phase, self.phase_name = "night", "장 마감 후"
         # 매매 결과 기준일: 오늘 04:00 ET 이후면 오늘, 아니면 직전 거래일
         self.basis = self.today if (self.session_today and self.min >= 240) else tcal.prev_session(self.today)
-        # 결과 확정 기대일: 마감 + 3시간(켈 야간 스캔·로스 리포트 이후)
-        self.settled = self.today if (self.session_today and self.min >= self.close_min + 180) else tcal.prev_session(self.today)
+        # 결과 확정 기대일: 모든 야간 작업(켈 23:15 UTC · MA 다음날 00:15 UTC)이 끝났을 시각 = 거래일 다음날 01:30 UTC
+        self.settled = self.last_due(1, 1, 30)
         self.next_session = self.today if (self.session_today and self.min < self.close_min) else self._next(self.today)
+
+    def last_due(self, day_offset: int, hh: int, mm: int) -> date:
+        """'거래일 d + day_offset 일의 hh:mm UTC' 가 이미 지난 가장 최근 거래일 d (야간 작업 기대일 계산)."""
+        d = self.today if self.session_today else tcal.prev_session(self.today)
+        for _ in range(10):
+            due = datetime(d.year, d.month, d.day, hh, mm, tzinfo=UTC) + timedelta(days=day_offset)
+            if self.now >= due:
+                return d
+            d = tcal.prev_session(d)
+        return d
 
     @staticmethod
     def _next(d: date) -> date:
@@ -488,8 +499,8 @@ def assess_kell(K: dict, h: dict, ctx: Ctx, acct: dict | None) -> dict:
     nightly = [j for j in jobs if j["job"] == "nightly"]
     last_ok = next((j for j in nightly if j["ok"]), None)
     last = nightly[0] if nightly else None
-    # 야간 스캔 기대일: 마감 + 3시간 지난 마지막 거래일
-    exp = ctx.settled
+    # 야간 스캔 기대일: 크론(거래일 23:15 UTC) + 60분 여유가 지난 마지막 거래일 — 서머타임과 무관
+    exp = ctx.last_due(1, 0, 15)
     if not b:
         data = lv("warn", "서버 응답 없음 — DB 기록으로만 판정")
     elif b.get("fmp") is False:
@@ -604,43 +615,222 @@ def assess_kell(K: dict, h: dict, ctx: Ctx, acct: dict | None) -> dict:
             "issues": iss, "headline": stat["analysis"]["text"]}
 
 
-# ───────────────────────── 통합 위험
-def assess_risk(J: dict, R: dict, K: dict, acct: dict | None) -> dict:
+# ───────────────────────── 20·60 이동평균선 추세 (MA)
+MA_KIND = {"A": "A 하락→상승 전환", "B": "B 20/60 정배열 초기", "C": "C 상승 중 눌림", "down": "하락", "flat": "횡보", "excluded": "제외"}
+MA_MODE = {"research": "연구(신호만)", "paper": "가상(모의)", "approve": "실매매·수동 승인", "auto": "실매매·완전 자동", "exit_only": "청산 전용"}
+MA_COST_SIDE = 0.001
+MA_DAY_LOSS = 0.02
+
+
+def assess_ma(M: dict, h: dict, ctx: Ctx, acct: dict | None) -> dict:
+    app = "MA"
+    url = APPS[app]["url"]
     iss = []
-    pos = (R.get("positions") or []) + (K.get("positions") or [])
+    st = M.get("settings") or {}
+    mode = st.get("mode", "research")
+    book = {"paper": "paper", "approve": "live", "auto": "live"}.get(mode)
+    live = book == "live"
+    mode_name = MA_MODE.get(mode, mode)
+    b = (h or {}).get("body") or {}
+    equity = st.get("equity")
+
+    srv = server_level(app, h)
+    if srv["level"] == "fail":
+        iss.append(issue(app, "P1" if live else "P2", "server", "MA20·60 서버 응답 없음", srv["text"]))
+
+    jobs = M.get("jobs") or []
+    nightly = [j for j in jobs if j["job"] == "nightly"]
+    last_ok = next((j for j in nightly if j["ok"]), None)
+    last = nightly[0] if nightly else None
+    if not b:
+        data = lv("warn", "서버 응답 없음 — DB 기록으로만 판정")
+    elif b.get("fmp") is False:
+        data = lv("fail", "FMP 키 없음")
+        iss.append(issue(app, "P2", "fmp", "MA20·60 FMP 키 없음"))
+    elif last and last["ok"] is False and (not last_ok or last["id"] > last_ok["id"]):
+        data = lv("warn", f"최근 야간 작업 실패: {(last['error'] or '')[-100:]}")
+    else:
+        data = lv("ok", "FMP 일봉 수집 정상")
+
+    # 분석: 야간 크론(거래일 다음날 00:15 UTC) + 60분 여유
+    exp = ctx.last_due(1, 1, 15)
+    as_of = _d(last_ok["as_of"]) if last_ok else None
+    watch = M.get("watch") or []
+    w_live = [w for w in watch if w["status"] == "watch"]
+    w_paper = [w for w in watch if w["status"] == "paper_only"]
+    if not last_ok:
+        ana = lv("fail", "야간 분석 성공 기록 없음")
+        iss.append(issue(app, "P2", "no_nightly", "MA20·60 야간 분석 기록 없음", "", url + "/#today"))
+    elif as_of and as_of >= exp:
+        k = last_ok.get("kinds") or {}
+        msg = (f"{as_of} 야간 분석 완료 · A {k.get('A', 0)} · B {k.get('B', 0)} · C {k.get('C', 0)} · 신호 {last_ok.get('signals') or 0}"
+               f" · 매수 가능 {last_ok.get('buyable') or 0} · 진입 대기 {len(w_live) + len(w_paper)}")
+        if not (w_live or w_paper):
+            msg += " (조건 충족 종목 없음 — 정상)"
+        ana = lv("ok", msg, at=iso(last_ok["finished"]))
+    else:
+        failed = last and last["ok"] is False
+        ana = lv("fail" if failed else "warn", f"야간 분석 {'실패' if failed else '지연'} — 최신 {as_of}, 기대 {exp}")
+        iss.append(issue(app, "P2", f"nightly:{exp}", f"MA20·60 야간 분석 {'실패' if failed else '지연'}",
+                         f"최신 성공 {as_of} · 기대 {exp}" + (f" · {(last['error'] or '')[-120:]}" if failed else ""), url + "/#today"))
+
+    # 거래(장중 관리·주문)
+    pos = M.get("pos_open") or []
+    mypos = [p for p in pos if p["book"] == book] if book else []
+    tr = []
+    a = (acct or {}).get(app) or {}
+    bk = ((a.get("data") or {}).get("book")) if a.get("ok") else None
+    if mode == "research":
+        tr.append(lv("idle", "연구 모드 — 신호만 기록, 매매 없음"))
+    else:
+        br = M.get("broker")
+        if br and "실패" in (br["msg"] or ""):
+            tr.append(lv("warn" if not live else "fail", f"최근 키움 연결 점검 실패 ({tm_short(br['at'])})"))
+            if live:
+                iss.append(issue(app, "P1", "kiwoom", "MA20·60 키움증권 연결 실패", br["msg"], url + "/#today"))
+        if ctx.phase == "regular" and ctx.min >= 575:
+            if bk:
+                last_tick = (bk.get("state") or {}).get("last_tick")
+                age = time.time() - float(last_tick) if last_tick else None
+                if age is None or age > 300:
+                    tr.append(lv("fail", "장중 관리 루프 신호 끊김" + (f" — {int(age)}초 전" if age else " — 오늘 기록 없음")))
+                    iss.append(issue(app, "P1" if live else "P2", f"engine:{ctx.today}", "MA20·60 장중 관리 중단 의심",
+                                     "5분 이상 장중 관리 신호 없음", url + "/#today"))
+                else:
+                    tr.append(lv("ok", f"장중 관리 가동 · {int(age)}초 전 점검"))
+            elif not a.get("configured"):
+                tr.append(lv("warn" if mypos else "ok", "장중 관리 상태 확인 불가 — MA_APP_PASSWORD 미설정" if mypos else f"{mode_name} 모드 · 보유 없음"))
+    noprot = [p for p in mypos if not p.get("stop")]
+    if noprot:
+        tr.append(lv("fail", f"손절가 없는 보유 {len(noprot)}건"))
+        iss.append(issue(app, "P1" if live else "P2", "nostop", "MA20·60 손절가 없는 포지션", ", ".join(p["symbol"] for p in noprot), url + "/#today"))
+    locks = M.get("locks") or []
+    stuck = [o for o in M.get("orders") or [] if o["status"] == "unknown" or
+             (o["status"] == "sending" and time.time() - (_ts(o["sent_at"]) or _ts(o["created"]) or time.time()) > 300)]
+    if locks or stuck:
+        syms = sorted({x["symbol"] for x in locks} | {o["symbol"] for o in stuck})
+        tr.append(lv("fail", f"주문 상태 불명·종목 잠금 {len(syms)}건"))
+        iss.append(issue(app, "P1", "order_unknown", "MA20·60 주문 상태 불명(접수 여부 불확실)", ", ".join(syms) + " — 대사 필요", url + "/#today"))
+    e24 = M.get("errs24") or {}
+    if e24.get("n"):
+        tr.append(lv("warn", f"24시간 오류·거부 {e24['n']}건"))
+    trd = max(tr, key=lambda x: LV_ORDER[x["level"]]) if tr else lv("ok", f"{mode_name} 모드 · 보유 {len(mypos)}건")
+    stat = {"server": srv, "data": data, "analysis": ana, "trade": trd}
+
+    # 성과 (청산 완료, 비용 반영 순손익)
+    closed = [p for p in M.get("pos_closed") or [] if not book or p["book"] == book]
+    def row(p):
+        fee = MA_COST_SIDE * 2 * (p["entry"] or 0) * (p["qty"] or 0)
+        ent, ext = _ts(p["opened_at"]), _ts(p["closed_at"])
+        base = (p["risk_ps"] or 0) * (p["qty"] or 0)
+        return {"pnl": (p["realized"] or 0) - fee, "r": ((p["realized"] or 0) - fee) / base if base else None,
+                "exit_ts": ext, "hold_s": (ext - ent) if ext and ent else None}
+    cum = perf([row(p) for p in closed], equity)
+    if cum.get("avg_hold_s"):
+        cum["avg_hold_days"] = round(cum["avg_hold_s"] / 86400, 1)
+    day_closed = [p for p in closed if p["closed_at"] and p["closed_at"].astimezone(ET).date() == ctx.basis]
+    day_real = round(sum(row(p)["pnl"] for p in day_closed), 2)
+    # 보유 — 실시간 평가는 앱 장부 API(비밀번호 설정 시), 없으면 DB 값만
+    live_px = {p["symbol"]: p for p in (bk or {}).get("open") or []}
+    unreal, plist = 0.0, []
+    for p in mypos:
+        lp = live_px.get(p["symbol"]) or {}
+        px = lp.get("price")
+        u = (px - p["entry"]) * (p["qty_open"] or 0) if px and p["entry"] else None
+        if u is not None:
+            unreal += u
+        plist.append({"app": app, "account": "키움증권" + ("" if live else " 가상"), "symbol": p["symbol"], "qty": p["qty_open"],
+                      "entry": p["entry"], "last": px, "stop": p["stop"], "unreal": r2(u),
+                      "risk_to_stop": r2((p["entry"] - p["stop"]) * (p["qty_open"] or 0)) if p["stop"] else None,
+                      "days": (ctx.today - p["opened_at"].astimezone(ET).date()).days if p["opened_at"] else None,
+                      "kind": f"20·60 {p['kind']}형", "protected": bool(p.get("stop")), "status": "다음 개장 청산 예정" if p.get("exit_next_open") else "보유"})
+    loss_use = round(-day_real / (equity * MA_DAY_LOSS) * 100, 1) if (equity and day_real < 0) else 0.0
+    if loss_use >= 100:
+        iss.append(issue(app, "P1" if live else "P2", f"loss:{ctx.basis}", "MA20·60 하루 손실한도(R4 2%) 도달",
+                         f"실현 ${day_real} / 한도 ${equity * MA_DAY_LOSS:.0f}"))
+    scan = {r["kind"]: r for r in M.get("scan") or []}
+    sig = sum(r["sig"] for r in scan.values())
+    buy = sum(r["buy"] for r in scan.values())
+    funnel = {"as_of": iso(M.get("scan_as_of"))[:10] if M.get("scan_as_of") else None,
+              "scanned": sum(r["n"] for r in scan.values()), "kinds": {k: scan.get(k, {}).get("n", 0) for k in MA_KIND},
+              "signals": sig, "buyable": buy, "watch_live": len(w_live), "watch_paper": len(w_paper),
+              "excluded": len([w for w in watch if w["status"] == "excluded"]),
+              "entries": len([p for p in mypos if p["opened_at"] and p["opened_at"].astimezone(ET).date() == ctx.basis]),
+              "closed": len(day_closed), "fails": M.get("fails") or []}
+    res = M.get("research") or {}
+    appr = res.get("approval") or {}
+    research = {"name": res.get("name"), "at": iso(res.get("created")), "status": res.get("status"),
+                "kinds": {k: {"pass": (v or {}).get("pass"), **{kk: ((v or {}).get("holdout") or {}).get(kk) for kk in ("n", "pf", "win", "avg_r")}}
+                          for k, v in appr.items() if k in ("A", "B", "C")}}
+    account = {"source": "전략 자본(설정)", "capital_setting": equity, "env": book}
+    if a.get("ok"):
+        fd = (a.get("data") or {}).get("funds") or {}
+        account.update(source="키움증권 실조회", at=iso(a.get("at")), cash_usd=fd.get("usd_cash"), orderable_usd=fd.get("usd_orderable"),
+                       krw_cash=fd.get("krw_cash"), error=a.get("err"))
+    elif a.get("configured"):
+        account["error"] = a.get("err")
+    m = M.get("market") or {}
+    md = m.get("data") or {}
+    return {"app": app, "status": stat, "overall": worst(*stat.values()), "mode": mode, "mode_name": mode_name, "book": book, "live": live,
+            "basis": ctx.basis.isoformat(), "settings": {k: st.get(k) for k in ("equity", "risk_rate", "max_positions", "max_new_per_day", "max_order_usd", "type_status")},
+            "market": {"as_of": iso(m.get("as_of"))[:10] if m.get("as_of") else None, "SPY": md.get("SPY"), "QQQ": md.get("QQQ"), "breadth": md.get("breadth")},
+            "watch": [{**w, "for_date": iso(w["for_date"])[:10]} for w in watch], "funnel": funnel, "cum": cum, "day_realized": day_real,
+            "unrealized": round(unreal, 2) if live_px else None, "positions": plist, "account": account, "research": research,
+            "loss_limit": {"limit": round(equity * MA_DAY_LOSS, 2) if equity else None, "used_pct": loss_use, "realized": day_real},
+            "jobs": [{**j, "started": iso(j["started"]), "finished": iso(j["finished"]), "as_of": iso(j["as_of"])} for j in jobs[:6]],
+            "protect_n": M.get("protect_n"), "issues": iss, "headline": stat["analysis"]["text"]}
+
+
+def tm_short(x):
+    t = _ts(x)
+    return datetime.fromtimestamp(t, ET).strftime("%m-%d %H:%M ET") if t else "-"
+
+
+# ───────────────────────── 통합 위험
+def assess_risk(J: dict, R: dict, K: dict, M: dict, acct: dict | None) -> dict:
+    iss = []
+    pos = (R.get("positions") or []) + (K.get("positions") or []) + (M.get("positions") or [])
     other = R.get("other_holdings") or []
     syms = {}
     for p in pos + other:
         syms.setdefault(p["symbol"], set()).add(p["account"])
     dup = [s for s, a in syms.items() if len(a) > 1]
     if dup:
-        iss.append(issue("DASH", "P3", "dup", "두 계좌 동일 종목 보유", ", ".join(dup)))
+        iss.append(issue("DASH", "P3", "dup", "여러 계좌 동일 종목 보유", ", ".join(dup)))
     m = (J or {}).get("market") or {}
-    unknown = sum(1 for i in (R.get("issues") or []) + (K.get("issues") or []) if "불명" in i["title"] or "미청산" in i["title"])
-    stale = sum(1 for x in (J, R, K) for i in (x.get("issues") or []) if any(w in i["title"] for w in ("지연", "데이터", "미생성")))
+    trade_apps = (R, K, M)
+    unknown = sum(1 for x in trade_apps for i in (x.get("issues") or []) if "불명" in i["title"] or "미청산" in i["title"])
+    stale = sum(1 for x in (J, R, K, M) for i in (x.get("issues") or []) if any(w in i["title"] for w in ("지연", "데이터", "미생성")))
     risk_to_stop = round(sum(p.get("risk_to_stop") or 0 for p in pos), 2)
-    acc_rows = []
-    ra, ka = R.get("account") or {}, K.get("account") or {}
-    acc_rows.append({"name": "토스증권 (Ross)", "source": ra.get("source"), "capital": ra.get("capital_setting"),
-                     "realized_today": R.get("day_pnl"), "unreal": None, "open": len(R.get("positions") or []),
-                     "excluded_holdings": len(other), "error": ra.get("error")})
-    acc_rows.append({"name": "한국투자증권 (Kell)" + ("" if K.get("env") == "live" else " · " + (K.get("mode_name") or "")),
-                     "source": ka.get("source"), "capital": ka.get("capital_setting"), "cash": ka.get("cash_usd"),
-                     "realized_today": K.get("day_realized"), "unreal": K.get("unrealized"), "open": len(K.get("positions") or []),
-                     "error": ka.get("error")})
-    live_cap = [x for x in (ra.get("capital_setting"),) if x]
-    if K.get("env") == "live" and ka.get("capital_setting"):
-        live_cap.append(ka["capital_setting"])
+    ra, ka, ma = R.get("account") or {}, K.get("account") or {}, M.get("account") or {}
+    k_live, m_live = K.get("env") == "live", bool(M.get("live"))
+    acc_rows = [
+        {"name": "토스증권 (Ross)", "source": ra.get("source"), "capital": ra.get("capital_setting"), "live": True,
+         "realized_today": R.get("day_pnl"), "unreal": None, "open": len(R.get("positions") or []),
+         "excluded_holdings": len(other), "error": ra.get("error")},
+        {"name": "한국투자증권 (Kell)" + ("" if k_live else " · " + (K.get("mode_name") or "")), "live": k_live,
+         "source": ka.get("source"), "capital": ka.get("capital_setting"), "cash": ka.get("cash_usd"),
+         "realized_today": K.get("day_realized"), "unreal": K.get("unrealized"), "open": len(K.get("positions") or []),
+         "error": ka.get("error")},
+        {"name": "키움증권 (MA20·60)" + ("" if m_live else " · " + (M.get("mode_name") or "")), "live": m_live,
+         "source": ma.get("source"), "capital": ma.get("capital_setting"), "cash": ma.get("orderable_usd", ma.get("cash_usd")),
+         "realized_today": M.get("day_realized"), "unreal": M.get("unrealized"), "open": len(M.get("positions") or []),
+         "error": ma.get("error")},
+    ]
+    live_cap = [r["capital"] for r in acc_rows if r["live"] and r["capital"]]
     total_cap = round(sum(live_cap), 2) if live_cap else None
-    real_today = round((R.get("day_pnl") or 0) + (K.get("day_realized") if K.get("env") == "live" else 0), 2)
-    if not os_env_has_passwords():
-        iss.append(issue("DASH", "P3", "acct_setup", "증권사 실잔고 미연동",
-                         "Render 환경변수 ROSS_APP_PASSWORD · KELL_APP_PASSWORD 입력 시 실제 잔고로 표시(현재 설정 자본 기준)", None))
+    real_today = round(sum((r["realized_today"] or 0) for r in acc_rows if r["live"]), 2)
+    unreal_all = round(sum(r["unreal"] or 0 for r in acc_rows), 2)
+    missing = [k for k in ("ROSS", "KELL", "MA") if not os.environ.get(f"{k}_APP_PASSWORD")]
+    if missing:
+        iss.append(issue("DASH", "P3", "acct_setup", "증권사 실잔고 일부 미연동",
+                         "Render 환경변수 " + " · ".join(f"{k}_APP_PASSWORD" for k in missing) + " 입력 시 실잔고·장중 관리 상태 표시", None))
     return {"accounts": acc_rows, "positions": pos, "other_holdings": other, "duplicates": dup, "total_capital_live": total_cap,
-            "realized_today_live": real_today, "unreal_kell": K.get("unrealized"), "risk_to_stop": risk_to_stop,
-            "loss_limit": R.get("loss_limit"), "trial": R.get("trial"),
+            "realized_today_live": real_today, "unreal_all": unreal_all, "unreal_kell": K.get("unrealized"), "risk_to_stop": risk_to_stop,
+            "loss_limit": R.get("loss_limit"), "ma_loss_limit": M.get("loss_limit"), "trial": R.get("trial"),
             "market": {"stage": m.get("stage"), "name": m.get("name"), "defense": m.get("defense"), "change": m.get("change"),
-                       "kell_regime": ((K.get("market") or {}).get("regime"))},
+                       "kell_regime": ((K.get("market") or {}).get("regime")),
+                       "ma_spy": (((M.get("market") or {}).get("SPY")) or {}).get("stage")},
             "unknown_orders": unknown, "data_warnings": stale, "issues": iss,
             "note": "통합 대시보드는 조회·경보 전용입니다. 자동매매 중지·청산은 각 전략 서버가 책임집니다."}
 

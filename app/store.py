@@ -48,6 +48,20 @@ def _ingest_src(src: str, sql: str, mapper) -> int:
     return len(rows)
 
 
+MA_EV = {"nightly": ("분석 완료", "P3"), "error": ("오류", "P2"), "manage_error": ("장중 관리 오류", "P2"), "order_sent": ("주문 접수", "P2"),
+         "order_unknown": ("주문 불확실", "P1"), "order_rejected": ("주문 거부", "P2"), "order_cancel": ("주문 취소", "P3"),
+         "exit_plan": ("청산 예정", "P2"), "reconcile": ("잔고 대사 차이", "P2"), "settings": ("설정 변경", "P3"), "mode": ("모드 변경", "P3"),
+         "protect": ("보유 보호", "P3"), "broker": ("키움 연결 점검", "P4"), "funds": ("매수 여력 확인", "P4"), "research": ("과거 검증", "P4"),
+         "fill": ("체결", "P2"), "entry": ("진입", "P2"), "exit": ("청산", "P2")}
+
+
+def _ma(r):
+    name, sev = MA_EV.get(r["kind"], (r["kind"], "P3"))
+    if r["kind"] == "broker" and "실패" in (r["msg"] or ""):
+        name, sev = "키움 연결 실패", "P2"
+    return ("MA", name, sev, r["symbol"], r["msg"], None)
+
+
 def _jones(r):
     if r["kind"] == "startup":
         return ("JONES", "서버 시작", "P4", None, r["msg"], None)
@@ -73,6 +87,7 @@ def ingest() -> dict:
     out["jones"] = _ingest_src("ptj_events", "select id, at, kind, level, left(msg, 600) msg from ptj_events where id > %s order by id limit 500", _jones)
     out["ross"] = _ingest_src("rc_auto_events", "select id, at, kind, sym, left(msg, 600) msg from rc_auto_events where id > %s order by id limit 1000", _ross)
     out["kell"] = _ingest_src("kc_events", "select id, at, kind, symbol, left(msg, 600) msg from kc_events where id > %s order by id limit 500", _kell)
+    out["ma"] = _ingest_src("mt_events", "select id, at, kind, symbol, left(msg, 600) msg from mt_events where id > %s order by id limit 500", _ma)
     return out
 
 

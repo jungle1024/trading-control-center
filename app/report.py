@@ -10,14 +10,15 @@ from app import tcal
 
 
 def build(d, snap: dict) -> dict:
-    J, R, K, risk = snap["jones"], snap["ross"], snap["kell"], snap["risk"]
+    J, R, K, M, risk = snap["jones"], snap["ross"], snap["kell"], snap.get("ma") or {}, snap["risk"]
     ds = d.isoformat()
     m = J.get("market") or {}
     conds = {
         "Jones 시장분석": m.get("d") == ds,
         "Ross 체결 동기화(장 마감 리포트)": bool((R.get("report") or {}).get("exists")) and R.get("basis") == ds,
         "Kell 야간 스캔·잔고": K["status"]["analysis"]["level"] == "ok" and (K.get("funnel") or {}).get("scan_as_of") == ds,
-        "세 앱 상태 수집": all(x["status"]["server"]["level"] != "fail" for x in (J, R, K)),
+        "MA20·60 야간 분석": (M.get("status") or {}).get("analysis", {}).get("level") == "ok" and (M.get("funnel") or {}).get("as_of") == ds,
+        "전 앱 상태 수집": all(x["status"]["server"]["level"] != "fail" for x in (J, R, K, M) if x.get("status")),
         "손익·위험 계산": True,
     }
     status = "확정" if all(conds.values()) else "잠정"
@@ -26,6 +27,11 @@ def build(d, snap: dict) -> dict:
     nxt = []
     if m.get("risk", 0) >= 3:
         nxt.append(f"Jones {m.get('name')} 지속 여부 검토 (경보 {len(m.get('warnings') or [])}건)")
+    if M.get("positions"):
+        nxt.append("MA20·60 보유 " + ", ".join(p["symbol"] for p in M["positions"]) + " 손절·청산 예정 점검")
+    if (M.get("funnel") or {}).get("watch_live") or (M.get("funnel") or {}).get("watch_paper"):
+        f = M["funnel"]
+        nxt.append(f"MA20·60 진입 대기 {f.get('watch_live', 0) + f.get('watch_paper', 0)}종목 ({M.get('mode_name')})")
     if K.get("positions"):
         nxt.append("Kell 보유 " + ", ".join(p["symbol"] for p in K["positions"]) + " 손절 기준 점검")
     for i in issues:
@@ -41,13 +47,18 @@ def build(d, snap: dict) -> dict:
     sec_k = {"mode": K.get("mode_name"), "holdings": len(K.get("positions") or []), "entries": (K.get("funnel") or {}).get("entries"),
              "realized": K.get("day_realized"), "unrealized": K.get("unrealized"), "watch_live": (K.get("funnel") or {}).get("watch_live"),
              "passed": (K.get("funnel") or {}).get("passed"), "scan_as_of": (K.get("funnel") or {}).get("scan_as_of")}
+    mf = M.get("funnel") or {}
+    sec_m = {"mode": M.get("mode_name"), "holdings": len(M.get("positions") or []), "entries": mf.get("entries"),
+             "realized": M.get("day_realized"), "unrealized": M.get("unrealized"), "signals": mf.get("signals"), "buyable": mf.get("buyable"),
+             "watch": (mf.get("watch_live") or 0) + (mf.get("watch_paper") or 0), "scan_as_of": mf.get("as_of"),
+             "research_pass": {k: v.get("pass") for k, v in ((M.get("research") or {}).get("kinds") or {}).items()}}
     return {
         "date": ds, "status": status, "conditions": conds, "session": tcal.is_session(d),
         "jones": {"stage": m.get("stage"), "name": m.get("name"), "change": m.get("change"), "warnings": len(m.get("warnings") or []),
                   "new_candidates": (J.get("discover") or {}).get("new"), "candidates": (J.get("discover") or {}).get("n"),
                   "defense": m.get("defense"), "market_d": m.get("d")},
-        "ross": sec_r, "kell": sec_k,
-        "risk": {"realized_total_live": risk.get("realized_today_live"), "unreal_kell": risk.get("unreal_kell"),
+        "ross": sec_r, "kell": sec_k, "ma": sec_m,
+        "risk": {"realized_total_live": risk.get("realized_today_live"), "unreal_kell": risk.get("unreal_kell"), "unreal_all": risk.get("unreal_all"),
                  "loss_limit_breach": sum(1 for i in issues if "손실한도 초과" in i["title"]),
                  "incidents_open": len([i for i in issues if i["severity"] in ("P1", "P2")]),
                  "incidents_resolved": len(snap.get("resolved") or [])},
@@ -64,6 +75,7 @@ def to_text(r: dict) -> str:
              f"1) Jones: {v(J['name'])} · 전일 대비 {v(J['change'])} · 경보 {J['warnings']} · 후보 {v(J['candidates'])}(신규 {v(J['new_candidates'])})",
              f"2) Ross: 청산 {v(Ro['closed'])}건 · 승률 {v(Ro['win_rate'], '{}%', '-')} · 실현 {v(Ro['realized'], '${:+.2f}')} · 미확인 주문 {Ro['unknown_orders']}건",
              f"3) Kell({Ke['mode']}): 보유 {Ke['holdings']} · 신규 {v(Ke['entries'])} · 실현 {v(Ke['realized'], '${:+.2f}')} · 평가 {v(Ke['unrealized'], '${:+.2f}')}",
+             (f"3b) MA20·60({r['ma']['mode']}): 보유 {r['ma']['holdings']} · 신호 {v(r['ma']['signals'])} · 매수 가능 {v(r['ma']['buyable'])} · 진입 대기 {r['ma']['watch']} · 실현 {v(r['ma']['realized'], '${:+.2f}')}" if r.get("ma") else "3b) MA20·60: 미수신"),
              f"4) 위험: 실매매 실현 합계 {v(Ri['realized_total_live'], '${:+.2f}')} · 손실한도 초과 {Ri['loss_limit_breach']} · 미해결 장애 {Ri['incidents_open']}",
              "5) 다음 거래일: " + " / ".join(r["next"][:4])]
     if r["status"] == "잠정":

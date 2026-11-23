@@ -1,6 +1,6 @@
-"""Global Trading Control Center — 미국 주식 3대 전략 통합 운영 대시보드.
+"""Global Trading Control Center — 미국 주식 전략 통합 운영 대시보드.
 
-세 전략 앱(Jones·Ross·Kell)은 독립적으로 분석·매매하고, 이 앱은 그 결과를 읽어 모니터링만 한다.
+전략 앱(Jones·Ross·Kell·MA20·60)은 독립적으로 분석·매매하고, 이 앱은 그 결과를 읽어 모니터링만 한다.
 - 주문 권한 없음 · 증권사 주문 키 없음 · 전략 앱 코드/DB 변경 없음
 - 이 서버가 멈춰도 Ross·Kell 자동매매는 영향 없음
 """
@@ -20,7 +20,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 
 from app import assess, db, report, sources, store, tcal
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 DASH_PASSWORD = os.environ.get("DASH_PASSWORD", "")
 SESSION_SECRET = os.environ.get("SESSION_SECRET", "tcc-dev-secret")
 INTERVAL = int(os.environ.get("COLLECT_INTERVAL_S", "60"))
@@ -102,7 +102,6 @@ async def collect():
     try:
         ctx = assess.Ctx()
         health = await sources.probe_all()
-        acct = await sources.accounts() if (os.environ.get("ROSS_APP_PASSWORD") or os.environ.get("KELL_APP_PASSWORD")) else {}
 
         async def read(fn, name):
             try:
@@ -110,7 +109,15 @@ async def collect():
             except Exception as e:
                 errs.append(f"{name}: {type(e).__name__}: {e}")
                 return None, f"{type(e).__name__}: {e}"
-        (J, ej), (R, er), (K, ek) = await asyncio.gather(read(sources.jones, "jones"), read(sources.ross, "ross"), read(sources.kell, "kell"))
+        (J, ej), (R, er), (K, ek), (M, em) = await asyncio.gather(read(sources.jones, "jones"), read(sources.ross, "ross"),
+                                                                   read(sources.kell, "kell"), read(sources.ma, "ma"))
+        ma_book = {"paper": "paper", "approve": "live", "auto": "live"}.get(((M or {}).get("settings") or {}).get("mode"))
+        acct = {}
+        if any(os.environ.get(f"{k}_APP_PASSWORD") for k in ("ROSS", "KELL", "MA")):
+            try:
+                acct = await sources.accounts(ma_book=ma_book)
+            except Exception as e:
+                errs.append(f"accounts: {type(e).__name__}: {e}")
 
         def safe(fn, raw, err, app_id, *a):
             if raw is None:
@@ -123,8 +130,9 @@ async def collect():
         aj = safe(assess.assess_jones, J, ej, "JONES")
         ar = safe(assess.assess_ross, R, er, "ROSS", acct)
         ak = safe(assess.assess_kell, K, ek, "KELL", acct)
-        risk = assess.assess_risk(aj, ar, ak, acct)
-        issues = aj["issues"] + ar["issues"] + ak["issues"] + risk["issues"]
+        am = safe(assess.assess_ma, M, em, "MA", acct)
+        risk = assess.assess_risk(aj, ar, ak, am, acct)
+        issues = aj["issues"] + ar["issues"] + ak["issues"] + am["issues"] + risk["issues"]
         issues.sort(key=lambda i: (i["severity"], i["app"]))
 
         stored, resolved, ingest = [], [], {}
@@ -148,11 +156,11 @@ async def collect():
         snap = {"ready": True, "version": VERSION, "built_at": assess.iso(time.time()), "took_ms": int((time.time() - t0) * 1000),
                 "ctx": ctx.info(), "apps": {k: {**{kk: v for kk, v in a.items() if kk != "url"}, "url": a["url"]} for k, a in sources.APPS.items()},
                 "health": {k: {kk: vv for kk, vv in (v or {}).items() if kk != "body"} | {"body": (v or {}).get("body")} for k, v in health.items()},
-                "jones": aj, "ross": ar, "kell": ak, "risk": risk, "issues": issues,
+                "jones": aj, "ross": ar, "kell": ak, "ma": am, "risk": risk, "issues": issues,
                 "resolved": [{**r, "first_seen": assess.iso(r["first_seen"]), "resolved_at": assess.iso(r["resolved_at"]),
                               "acked_at": assess.iso(r["acked_at"])} for r in resolved],
                 "ingest": ingest, "errors": errs, "ntfy": bool(store.NTFY_TOPIC),
-                "accounts_linked": {k: bool(os.environ.get(f"{k}_APP_PASSWORD")) for k in ("ROSS", "KELL")}}
+                "accounts_linked": {k: bool(os.environ.get(f"{k}_APP_PASSWORD")) for k in ("ROSS", "KELL", "MA")}}
         SNAP.clear()
         SNAP.update(snap)
         await _maybe_report(ctx)
