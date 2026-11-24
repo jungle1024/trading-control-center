@@ -215,3 +215,25 @@ def reports(limit=30):
 def report(d):
     r = q("select d, status, built_at, sent, data from dash_reports where d=%s", (d,))
     return r[0] if r else None
+
+
+async def topic_check() -> str:
+    """NTFY_TOPIC 이 바뀌었으면(해시 비교) 새 토픽으로 확인 메시지 1회 발송. 토픽 이름은 저장하지 않는다."""
+    import hashlib
+    if not NTFY_TOPIC:
+        return "미설정"
+    h = int(hashlib.sha256(NTFY_TOPIC.encode()).hexdigest()[:12], 16)
+    row = q("select last_id from dash_cursor where src='ntfy_topic'")
+    if row and row[0]["last_id"] == h:
+        return "변경 없음"
+    err = await send("✅ 통합 대시보드 알림 연결 확인",
+                     "알림 토픽이 설정·변경되어 이 토픽으로 연결을 확인합니다. 이 메시지가 보이면 긴급·중요 경보와 매일 09:30 일일보고서를 이 토픽으로 받습니다.",
+                     priority=3, tags=["white_check_mark"])
+    if err:
+        return f"발송 실패: {err}"
+    with rw() as cur:
+        cur.execute("""insert into dash_cursor(src, last_id, updated) values('ntfy_topic', %s, now())
+                       on conflict (src) do update set last_id=excluded.last_id, updated=now()""", (h,))
+        cur.execute("""insert into dash_events(event_id, at, app, kind, severity, msg, status) values(%s, now(), 'DASH', '알림 토픽 확인', 'P4', %s, 'info')
+                       on conflict do nothing""", (f"DASH:topic:{h}", "알림 토픽 변경 감지 — 확인 메시지 발송 성공"))
+    return "발송"

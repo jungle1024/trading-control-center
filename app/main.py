@@ -207,6 +207,11 @@ async def startup():
         await asyncio.to_thread(db.init)
     except Exception as e:
         STATE["errors"].append(f"db init: {e}")
+    try:
+        STATE["topic_check"] = await store.topic_check()
+        print("[ntfy] topic check:", STATE["topic_check"], flush=True)
+    except Exception as e:
+        STATE["errors"].append(f"topic check: {e}")
     if os.environ.get("TCC_LOOP", "on") != "off":
         asyncio.create_task(loop())
 
@@ -215,7 +220,8 @@ async def startup():
 @app.get("/health")
 async def health():
     return {"ok": True, "version": VERSION, "ready": SNAP.get("ready", False), "last_run": STATE["last_run"],
-            "db": bool(db.DATABASE_URL), "auth": bool(DASH_PASSWORD), "orders": "none (read-only)"}
+            "db": bool(db.DATABASE_URL), "auth": bool(DASH_PASSWORD), "orders": "none (read-only)",
+            "ntfy": bool(store.NTFY_TOPIC), "topic_check": STATE.get("topic_check")}
 
 
 @app.get("/")
