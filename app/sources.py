@@ -15,8 +15,8 @@ import httpx
 from app.db import q
 
 APPS = {
-    "JONES": {"name": "폴 튜더 존스", "short": "Jones", "role": "장기 시장분석·종목 발굴",
-              "url": os.environ.get("JONES_URL", "https://ptj-200-scanner-2e0a.onrender.com"), "trading": False},
+    "JONES": {"name": "폴 튜더 존스", "short": "Jones", "role": "시장분석·발굴 + ETF 200일 자동매매(한국투자 모의)",
+              "url": os.environ.get("JONES_URL", "https://ptj-200-scanner-2e0a.onrender.com"), "trading": True},
     "ROSS": {"name": "로스 카메론", "short": "Ross", "role": "초단타 자동 실매매 · 토스증권",
              "url": os.environ.get("ROSS_URL", "https://ross-cameron-scanner-zcc5.onrender.com"), "trading": True},
     "KELL": {"name": "올리버 켈", "short": "Kell", "role": "수축 돌파 수일 매매 · 한국투자증권",
@@ -136,7 +136,24 @@ def jones() -> dict:
     ev = q("""select id, at, d, kind, level, left(msg, 400) msg from ptj_events order by id desc limit 40""")
     restarts = q("select count(*) n from ptj_events where kind='startup' and at > now() - interval '24 hours'")
     alerts = q("select id, at, kind, title, sent, left(err, 200) err from ptj_alerts order by id desc limit 10")
-    return {"market": mk[0] if mk else None, "provisional": prov[0] if prov else None, "history": hist, "runs": runs,
+    # ETF 200일 자동매매(계좌 E) · 가상 운용(계좌 A·B·C) — 2026-11-24 추가
+    eng = q("select data, updated from ptj_settings where k='live_engine'")
+    live_pos = q("""select mode, symbol, (data->>'qty')::float qty, (data->>'entry')::float entry, (data->>'stop')::float stop,
+                           data->>'opened' opened, data->>'cond_id' cond_id, updated from ptj_live_pos""")
+    live_trades = q("""select id, mode, symbol, entry_d, exit_d, (data->>'pnl')::float pnl, (data->>'r')::float r, data->>'why' why
+                       from ptj_live_trades order by id""")
+    live_rep = q("""select d, data->'checks' checks, data->'reconcile'->'ok' rec_ok, data->'engine'->>'mode' mode, at
+                    from ptj_live_reports order by d desc limit 1""")
+    porders = q("""select et_date, mode, kind, ok, resp->>'code' code, count(*) n from ptj_orders
+                   where at > now() - interval '14 days' group by 1, 2, 3, 4, 5""")
+    paper = q("""select data->>'start' start, data->>'mode' mode,
+                        (select jsonb_object_agg(ak, jsonb_build_object('name', av->'name', 'book', av->'book', 'stats', av->'stats', 'open_n', jsonb_array_length(coalesce(av->'open', '[]'::jsonb))))
+                         from jsonb_each(data->'accounts') a(ak, av)) accts, updated
+                 from ptj_settings where k='paper_live'""")
+    return {"engine": (eng[0]["data"] if eng else None) or {"mode": "off"}, "engine_at": eng[0]["updated"] if eng else None,
+            "live_pos": live_pos, "live_trades": live_trades, "live_rep": live_rep[0] if live_rep else None, "porders": porders,
+            "paper": paper[0] if paper else None,
+            "market": mk[0] if mk else None, "provisional": prov[0] if prov else None, "history": hist, "runs": runs,
             "cand_d": d, "candidates": cands, "prev_syms": prev_syms, "outcomes": oc[0] if oc else {},
             "alert_eval": ae[0] if ae else None, "events": ev, "restarts24": restarts[0]["n"] if restarts else 0, "alerts": alerts}
 
@@ -192,7 +209,9 @@ def kell() -> dict:
     sig = q("""select for_date, env, action, count(*) n from kc_signals where for_date >= current_date - 10 group by 1, 2, 3""")
     shadow = q("select count(*) n, max(created) last from kc_shadow_signals where created > now() - interval '30 days'")
     ev = q("select id, at, kind, symbol, left(msg, 300) msg from kc_events order by id desc limit 40")
-    return {"settings": st, "broker": peak, "engine": eng, "jobs": jobs, "market": mk[0] if mk else None, "watch": watch,
+    alerts = q("""select count(*) n, count(*) filter (where coalesce((data->>'ok')::boolean, true) = false) bad, max(at) last
+                  from kc_events where kind='alert' and at > now() - interval '24 hours'""")
+    return {"alerts24": alerts[0] if alerts else {}, "settings": st, "broker": peak, "engine": eng, "jobs": jobs, "market": mk[0] if mk else None, "watch": watch,
             "scan": scan[0] if scan else None, "pos_open": pos_open, "pos_closed": pos_closed, "orders": orders,
             "signals": sig, "shadow": shadow[0] if shadow else {}, "events": ev}
 
@@ -231,7 +250,12 @@ def ma() -> dict:
     errs = q("""select count(*) n, max(at) last from mt_events where kind in ('manage_error','error','order_rejected')
                 and at > now() - interval '24 hours'""")
     protect = q("select count(*) n from mt_protect")
+    rep = q("""select day, book, created, data->'issues' issues, data->'holdings' holdings, data->'perf' perf from mt_reports
+               order by day desc, created desc limit 1""")
+    ver = q("select vid, status, activated_at, purpose from mt_versions where status='active' order by activated_at desc nulls last limit 1")
+    tg = q("select data from mt_settings where k='targets'")
     return {"settings": st.get("main") or {}, "jobs": jobs, "market": mk[0] if mk else None, "scan_as_of": sd[0]["d"] if sd else None,
             "scan": scan, "fails": fails, "watch": watch, "pos_open": pos_open, "pos_closed": pos_closed, "orders": orders,
             "locks": locks, "research": research[0] if research else None, "broker": broker[0] if broker else None,
-            "errs24": errs[0] if errs else {}, "protect_n": protect[0]["n"] if protect else 0}
+            "errs24": errs[0] if errs else {}, "protect_n": protect[0]["n"] if protect else 0,
+            "report": rep[0] if rep else None, "version": ver[0] if ver else None, "targets": tg[0]["data"] if tg else None}

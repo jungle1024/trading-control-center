@@ -24,7 +24,7 @@ SEV_RANK = {"P1": 1, "P2": 2, "P3": 3, "P4": 4}
 ROSS_KIND = {"start": ("엔진 시작", "P3"), "stop": ("엔진 정지", "P3"), "watch": ("감시 후보", "P4"), "skip": ("신호 탈락", "P4"),
              "order": ("주문 요청", "P3"), "entry": ("체결·진입", "P2"), "exit": ("청산", "P2"), "protect": ("손절 보호", "P4"),
              "data_block": ("데이터 차단", "P2"), "autosched": ("가동 설정", "P3"), "drop": ("감시 제외", "P4")}
-KELL_KIND = {"error": ("오류", "P2"), "nightly": ("분석 완료", "P3"), "engine": ("엔진", "P3"), "settings": ("설정 변경", "P3"),
+KELL_KIND = {"alert": ("ntfy 발송", "P4"), "error": ("오류", "P2"), "nightly": ("분석 완료", "P3"), "engine": ("엔진", "P3"), "settings": ("설정 변경", "P3"),
              "research": ("연구 작업", "P4"), "order": ("주문", "P2"), "fill": ("체결", "P2"), "exit": ("청산", "P2"), "stop": ("손절", "P2"),
              "signal": ("매매 신호", "P3"), "candidate": ("신규 후보", "P3")}
 
@@ -62,11 +62,17 @@ def _ma(r):
     return ("MA", name, sev, r["symbol"], r["msg"], None)
 
 
+JONES_EV = {"confirm": ("분석 완료", "P3"), "brief": ("시장 브리핑", "P4"), "error": ("오류", "P2"), "live_mode": ("ETF 엔진 모드", "P3"),
+            "live_error": ("ETF 엔진 오류", "P2"), "live_stop": ("비상 손절", "P1"), "live_order": ("ETF 주문", "P2"), "live_fill": ("ETF 체결", "P2"),
+            "paper_daily": ("가상 운용 결과", "P4"), "paper_bt": ("가상 운용 백테스트", "P4"), "live_report": ("ETF 장 마감 리포트", "P3")}
+
+
 def _jones(r):
     if r["kind"] == "startup":
         return ("JONES", "서버 시작", "P4", None, r["msg"], None)
-    sev = "P2" if r["level"] in ("error", "warn") else ("P2" if r["kind"] in ("regime", "alert") else "P3")
-    name = {"confirm": "분석 완료", "brief": "시장 브리핑", "error": "오류"}.get(r["kind"], r["kind"])
+    name, sev = JONES_EV.get(r["kind"], (r["kind"], "P3"))
+    if r["level"] in ("error",) and sev > "P2":
+        sev = "P2"
     return ("JONES", name, sev, None, r["msg"], None)
 
 

@@ -169,7 +169,9 @@ function overview() {
         <div><div class="big c-${tone}">${esc(m.stage || '—')}</div><div class="sm">${esc(m.name || '')}</div></div>
         <div style="display:flex;gap:16px;flex-wrap:wrap">${idx}</div></div>
       <div class="sm" style="margin-top:12px"><b>${esc(m.trend_long || '')}</b> / ${esc(m.early_warning || '')} · 같은 국면 ${m.streak || 0}일째 ${m.defense ? '· <span class="c-fail">방어 국면</span>' : ''}</div>
-      <div class="sm mut">시장 변화: 전일 대비 <b>${esc(m.change || '—')}</b> · 신규 발굴 후보 ${J.discover.new ?? '—'}개 (전체 ${J.discover.n}) · 기준일 ${m.d || '—'}</div></div>
+      <div class="sm mut">시장 변화: 전일 대비 <b>${esc(m.change || '—')}</b> · 신규 발굴 후보 ${J.discover.new ?? '—'}개 (전체 ${J.discover.n}) · 기준일 ${m.d || '—'}</div>
+      ${J.etf ? `<div class="sm" style="margin-top:8px;border-top:1px solid var(--line);padding-top:8px">ETF 200일 엔진 <span class="tag">${esc(J.etf.mode_name)}</span> · 보유 ${J.etf.positions.length}/${(J.etf.etfs || []).length} · 예산 $${f(J.etf.budget, 0)}
+        ${(J.etf.paper || []).length ? `<span class="mut"> · 가상 운용 ${J.etf.paper.map(a => `${esc((a.name || a.key).split(' ')[0])} ${pct(a.ret_pct, 2)}`).join(' / ')}</span>` : ''}</div>` : ''}</div>
     <div class="card"><h2><span class="no">03</span> 거래 성과 <span class="r xs mut">기준 거래일 ${R.basis}</span></h2>
       <div class="grid g3">
         <div><div class="sm mut">Ross 당일 실현손익</div><div class="big">${usd(R.day_pnl)}</div>
@@ -262,30 +264,31 @@ function market() {
 
 // ─────────────────────────────── Strategies
 function strategies() {
-  const R = S.ross, K = S.kell, J = S.jones, M = S.ma || {}, rc = R.cum || {}, kc = K.cum || {}, mc = M.cum || {}, MF = M.funnel || {};
+  const R = S.ross, K = S.kell, J = S.jones, M = S.ma || {}, E = J.etf || {}, rc = R.cum || {}, kc = K.cum || {}, mc = M.cum || {}, ec = E.cum || {}, MF = M.funnel || {};
   const hold = s => s == null ? '—' : s < 3600 ? `${Math.round(s / 60)}분` : s < 86400 ? `${f(s / 3600, 1)}시간` : `${f(s / 86400, 1)}일`;
   const rowsCmp = [
-    ['당일 청산', R.day.n || 0, K.funnel.closed, MF.closed ?? 0],
-    ['신규 진입(체결)', R.funnel.fills ?? 0, K.funnel.entries, MF.entries ?? 0],
-    ['누적 청산 거래', rc.n || 0, kc.n || 0, mc.n || 0],
-    ['승률', rc.n ? rc.win_rate + '%' : '—', kc.n ? kc.win_rate + '%' : '—', mc.n ? mc.win_rate + '%' : '—'],
-    ['실현 순손익(누적)', usd(rc.net), usd(kc.net), usd(mc.net)],
-    ['미실현 평가손익', '<span class="mut">당일 청산 원칙</span>', usd(K.unrealized), M.unrealized != null ? usd(M.unrealized) : '<span class="dim">연동 필요</span>'],
-    ['Profit Factor', rc.pf ?? '—', kc.pf ?? '—', mc.pf ?? '—'],
-    ['거래당 기대손익', usd(rc.expectancy), usd(kc.expectancy), usd(mc.expectancy)],
-    ['평균 R', rc.avg_r ?? '—', kc.avg_r ?? '—', mc.avg_r != null ? f(mc.avg_r) : '—'],
-    ['최대낙폭', usd(rc.mdd), usd(kc.mdd), usd(mc.mdd)],
-    ['누적수익률(자본 대비)', rc.ret_pct != null ? pct(rc.ret_pct, 2) : '—', kc.ret_pct != null ? pct(kc.ret_pct, 2) : '—', mc.ret_pct != null ? pct(mc.ret_pct, 2) : '—'],
-    ['주문 실패율', R.order_fail_rate != null ? R.order_fail_rate + '% (' + R.orders_submitted + '건 중)' : '—', '—', '—'],
-    ['평균 보유기간', hold(rc.avg_hold_s), kc.avg_hold_days != null ? kc.avg_hold_days + '일' : '—', mc.avg_hold_days != null ? mc.avg_hold_days + '일' : '—'],
+    ['당일 청산', R.day.n || 0, K.funnel.closed, MF.closed ?? 0, '—'],
+    ['신규 진입(체결)', R.funnel.fills ?? 0, K.funnel.entries, MF.entries ?? 0, '—'],
+    ['보유', 0, K.positions.length, (M.positions || []).length, (E.positions || []).length],
+    ['누적 청산 거래', rc.n || 0, kc.n || 0, mc.n || 0, ec.n || 0],
+    ['승률', rc.n ? rc.win_rate + '%' : '—', kc.n ? kc.win_rate + '%' : '—', mc.n ? mc.win_rate + '%' : '—', ec.n ? ec.win_rate + '%' : '—'],
+    ['실현 순손익(누적)', usd(rc.net), usd(kc.net), usd(mc.net), usd(ec.net)],
+    ['미실현 평가손익', '<span class="mut">당일 청산 원칙</span>', usd(K.unrealized), M.unrealized != null ? usd(M.unrealized) + (M.unreal_src && M.unreal_src !== '실시간' ? `<div class="xs dim">${esc(M.unreal_src)}</div>` : '') : '<span class="dim">연동 필요</span>', '<span class="dim">앱에서 확인</span>'],
+    ['Profit Factor', rc.pf ?? '—', kc.pf ?? '—', mc.pf ?? '—', ec.pf ?? '—'],
+    ['거래당 기대손익', usd(rc.expectancy), usd(kc.expectancy), usd(mc.expectancy), usd(ec.expectancy)],
+    ['평균 R', rc.avg_r ?? '—', kc.avg_r ?? '—', mc.avg_r != null ? f(mc.avg_r) : '—', ec.avg_r ?? '—'],
+    ['최대낙폭', usd(rc.mdd), usd(kc.mdd), usd(mc.mdd), usd(ec.mdd)],
+    ['누적수익률(자본 대비)', rc.ret_pct != null ? pct(rc.ret_pct, 2) : '—', kc.ret_pct != null ? pct(kc.ret_pct, 2) : '—', mc.ret_pct != null ? pct(mc.ret_pct, 2) : '—', ec.ret_pct != null ? pct(ec.ret_pct, 2) : '—'],
+    ['주문 실패율', R.order_fail_rate != null ? R.order_fail_rate + '% (' + R.orders_submitted + '건 중)' : '—', '—', '—', E.orders14 ? `가드 차단 ${E.orders14.fail} / ${E.orders14.ok + E.orders14.fail}건(14일)` : '—'],
+    ['평균 보유기간', hold(rc.avg_hold_s), kc.avg_hold_days != null ? kc.avg_hold_days + '일' : '—', mc.avg_hold_days != null ? mc.avg_hold_days + '일' : '—', ec.avg_hold_days != null ? ec.avg_hold_days + '일' : '—'],
   ];
   const fl = (items) => `<div class="flow">${items.map(([k, v]) => `<div class="s"><b>${v ?? '—'}</b><span>${k}</span></div>`).join('')}</div>`;
   const tr = R.trial;
   return `
-  <div class="card"><h2>Ross · Kell · MA20·60 동일 기준 성과 비교 <span class="r xs">청산 완료 포지션 단위 · 비용 반영 순손익</span></h2>
-    <div class="tw"><table><tr><th>지표</th><th class="n">Ross · 초단타 (토스)</th><th class="n">Kell · 수일 (${esc(K.mode_name)})</th><th class="n">MA20·60 · 수일~수주 (${esc(M.mode_name || '—')})</th></tr>
-    ${rowsCmp.map(r => `<tr><td>${r[0]}</td><td class="n">${r[1]}</td><td class="n">${r[2]}</td><td class="n">${r[3]}</td></tr>`).join('')}</table></div>
-    <div class="note">⚠ 전략마다 거래 기간·수익 구조가 달라 승률만으로 우열을 가리지 않습니다. 손익비·기대손익·자본 대비 수익률·최대낙폭을 함께 보세요.${[K.mode !== 'live' ? `Kell <b>${esc(K.mode_name)}</b>` : '', M.mode && !M.live ? `MA20·60 <b>${esc(M.mode_name)}</b>` : ''].filter(Boolean).map(x => ' ' + x).join(' ·')}${(K.mode !== 'live' || (M.mode && !M.live)) ? ' 모드는 실계좌 성과가 아닙니다.' : ''}</div></div>
+  <div class="card"><h2>Ross · Kell · MA20·60 · Jones E 동일 기준 성과 비교 <span class="r xs">청산 완료 포지션 단위 · 비용 반영 순손익</span></h2>
+    <div class="tw"><table><tr><th>지표</th><th class="n">Ross · 초단타 (토스)</th><th class="n">Kell · 수일 (${esc(K.mode_name)})</th><th class="n">MA20·60 · 수일~수주 (${esc(M.mode_name || '—')})</th><th class="n">Jones E · ETF 200일 (${esc(E.mode_name || '—')})</th></tr>
+    ${rowsCmp.map(r => `<tr><td>${r[0]}</td><td class="n">${r[1]}</td><td class="n">${r[2]}</td><td class="n">${r[3]}</td><td class="n">${r[4]}</td></tr>`).join('')}</table></div>
+    <div class="note">⚠ 전략마다 거래 기간·수익 구조가 달라 승률만으로 우열을 가리지 않습니다. 손익비·기대손익·자본 대비 수익률·최대낙폭을 함께 보세요.${[K.mode !== 'live' ? `Kell <b>${esc(K.mode_name)}</b>` : '', M.mode && !M.live ? `MA20·60 <b>${esc(M.mode_name)}</b>` : ''].filter(Boolean).map(x => ' ' + x).join(' ·')}${(K.mode !== 'live' || (M.mode && !M.live)) ? ' 모드는 실계좌 성과가 아닙니다.' : ''} Jones E는 한국투자 <b>모의투자</b> 계좌(실제 돈 아님)입니다.</div></div>
   <div class="grid g2 sec">
     <div class="card"><h2>Ross 오늘의 실행 흐름 · ${R.basis} <span class="r">${link('ROSS', '/#auto')}</span></h2>
       ${fl([['스캔', R.funnel.scans], ['감시 종목', R.funnel.watched], ['매매 신호', R.funnel.signals], ['신호 탈락', R.funnel.rejected], ['주문 요청', R.funnel.orders], ['실제 체결', R.funnel.fills], ['청산 완료', R.funnel.closed]])}
@@ -313,7 +316,10 @@ function strategies() {
       <span class="k">전략 자본</span><span>$${f(M.settings?.equity, 0)} · 거래당 위험 ${f((M.settings?.risk_rate || 0) * 100, 1)}%</span>
       <span class="k">보유·신규 한도</span><span>동시 ${M.settings?.max_positions ?? '—'}종목 · 하루 신규 ${M.settings?.max_new_per_day ?? '—'} · 1회 최대 $${f(M.settings?.max_order_usd, 0)}</span>
       <span class="k">하루 손실한도(R4 2%)</span><span>$${f(M.loss_limit?.limit, 0)} · 사용 ${f(M.loss_limit?.used_pct, 0)}%</span>
-      <span class="k">유형별 배포</span><span>${Object.entries(M.settings?.type_status || {}).map(([k, v]) => `${k} ${esc({research:'연구', paper:'가상', approved:'승인'}[v] || v)}`).join(' · ')}</span></div>
+      <span class="k">유형별 배포</span><span>${Object.entries(M.settings?.type_status || {}).map(([k, v]) => `${k} ${esc({research:'연구', paper:'가상', approved:'승인'}[v] || v)}`).join(' · ')}</span>
+      <span class="k">매매법 버전</span><span>${esc(M.version?.vid || '—')} ${M.version?.purpose ? '· ' + esc(M.version.purpose) : ''}</span>
+      ${M.targets ? `<span class="k">수익 목표(도전)</span><span>주 ${M.targets.weekly ?? '—'}% · 월 ${M.targets.monthly ?? '—'}% · 연 ${M.targets.annual ?? '—'}% <span class="xs dim">— 달성 보장 아님, 위험 한도 확대 사유 아님</span></span>` : ''}
+      <span class="k">최근 장 마감 리포트</span><span>${M.report ? `${esc(M.report.day)} · ${(M.report.issues || []).length ? '<b class="c-warn">' + M.report.issues.map(x => esc(x.class + ': ' + x.detail)).join(' · ') + '</b>' : '<span class="pos">이상 없음</span>'}` : '—'}</span></div>
       <h2 style="margin-top:14px">과거 검증 ${esc(M.research?.name || '')} (최종 미사용 구간)</h2>
       ${Object.keys(M.research?.kinds || {}).length ? `<div class="tw"><table><tr><th>유형</th><th class="n">거래</th><th class="n">PF</th><th class="n">승률</th><th class="n">평균 R</th><th>승인</th></tr>
         ${Object.entries(M.research.kinds).map(([k, v]) => `<tr><td>${k}</td><td class="n">${v.n ?? '—'}</td><td class="n">${v.pf ?? '—'}</td><td class="n">${v.win != null ? v.win + '%' : '—'}</td><td class="n">${v.avg_r ?? '—'}</td><td>${v.pass ? '<span class="pos">통과</span>' : '<span class="c-warn">미통과</span>'}</td></tr>`).join('')}</table></div>
@@ -323,11 +329,19 @@ function strategies() {
     <div class="card"><h2>Ross 최근 장 마감 리포트</h2><div class="tw"><table><tr><th>날짜</th><th class="n">거래</th><th class="n">승률</th><th class="n">순손익</th><th>확정</th></tr>
       ${R.recent.slice().reverse().map(r => `<tr><td>${esc(r.date)}</td><td class="n">${r.n ?? 0}</td><td class="n">${r.win_rate != null ? Math.round(r.win_rate * 100) + '%' : '—'}</td><td class="n">${usd(r.pnl)}</td><td>${r.final ? '확정' : '잠정'}</td></tr>`).join('') || '<tr><td colspan=5 class="empty">없음</td></tr>'}</table></div>
       ${R.checks.length ? `<h2 style="margin-top:14px">안전장치 점검 (${esc(R.checks[0].date)})</h2>${R.checks.map(c => `<div class="sm">${dot(c.status === 'OK' ? 'ok' : c.status === '해당 없음' ? 'idle' : 'fail')} ${esc(c.name)} <span class="mut">— ${esc(c.detail)}</span></div>`).join('')}` : ''}</div>
-    <div class="card"><h2>Jones — 승률 대신 분석 성과</h2><div class="kv">
-      <span class="k">시장 경보 적중률</span><span>${J.kpi.alert_hit_rate ?? '—'}%</span><span class="k">위험 탐지 선행기간</span><span>${J.kpi.alert_avg_lead ?? '—'}거래일</span>
+    <div class="card"><h2>Jones 운용 — ETF 200일 엔진(E) · 가상 운용 A·B·C <span class="r">${link('JONES', '/#run')}</span></h2>
+      <div class="kv"><span class="k">ETF 엔진 모드</span><span><b>${esc(E.mode_name || '—')}</b> · ${esc((E.etfs || []).join('·'))} · 예산 $${f(E.budget, 0)} · 1회 최대 $${f(E.max_order, 0)}</span>
+      <span class="k">증권사 상태</span><span class="sm">${esc(E.broker || '—')}</span>
+      <span class="k">최근 장 마감 점검</span><span>${E.report ? `${esc(E.report.d)} · ${E.report.bad.length ? '<b class="c-warn">이상 ' + E.report.bad.map(esc).join(', ') + '</b>' : '<span class="pos">' + E.report.n_checks + '개 항목 이상 없음</span>'}` : '<span class="dim">아직 없음(첫 판정 15:50 ET)</span>'}</span>
+      <span class="k">보유</span><span>${(E.positions || []).length ? E.positions.map(p => `${esc(p.symbol)} ${p.qty}주 @${f(p.entry)} (손절 ${f(p.stop)})`).join(' · ') : '없음'}</span></div>
+      ${(E.paper || []).length ? `<h2 style="margin-top:14px">가상 운용 계좌 (시작 ${esc(E.paper_start || '')}, 각 $100,000 · 실제 주문 아님)</h2>
+        <div class="tw"><table><tr><th>계좌</th><th class="n">평가액</th><th class="n">누적</th><th class="n">이번 달</th><th class="n">보유</th><th class="n">청산</th><th class="n">최대낙폭</th><th>신규 진입</th></tr>
+        ${E.paper.map(a => `<tr><td>${esc(a.name)}</td><td class="n">$${f(a.equity, 0)}</td><td class="n">${pct(a.ret_pct, 2)}</td><td class="n">${pct(a.month_pct, 2)}</td><td class="n">${a.open_n ?? 0}</td><td class="n">${a.trades ?? 0}</td><td class="n">${pct(a.mdd_pct, 2)}</td><td class="sm">${a.month_blocked ? '<b class="c-warn">월 손실한도로 중단</b>' : '가능'}</td></tr>`).join('')}</table></div>` : ''}
+      <h2 style="margin-top:14px">분석 성과 (승률 대신)</h2><div class="kv">
+      <span class="k">시장 경보 적중률</span><span>${J.kpi.alert_hit_rate ?? '—'}% · 선행 ${J.kpi.alert_avg_lead ?? '—'}거래일</span>
       <span class="k">발굴 후 20일 초과수익(중앙값)</span><span>${J.kpi.ex20_n ? pct(J.kpi.ex20_med) + ` (${J.kpi.ex20_n}건)` : '누적 중'}</span>
       <span class="k">오늘 후보 / 신규</span><span>${J.discover.n} / ${J.discover.new ?? '—'}</span></div>
-      <div class="note">국면(상승·둔화·경계·하락·회복)별 Ross·Kell 성과 비교는 거래 표본이 쌓이면 확장합니다 — 매매 당시 이미 발행된 Jones 판정만 사용합니다.</div></div>
+</div>
   </div>`;
 }
 
@@ -378,7 +392,7 @@ function events() {
       <div class="sm mut" style="margin-top:10px">Kell 야간 스캔·연구</div>${K.jobs.map(j => `<div class="sm">${dot(j.ok ? 'ok' : j.ok === false ? 'fail' : 'warn')} ${tm(j.started)} ${esc(j.job)} ${j.as_of ? esc(j.as_of.slice(0, 10)) : ''} ${j.ok == null ? '<span class="c-warn">진행 중/미완료</span>' : ''} ${j.error ? '<span class="c-fail">' + esc(j.error.slice(-90)) + '</span>' : ''}</div>`).join('')}
       ${S.ma && S.ma.jobs ? `<div class="sm mut" style="margin-top:10px">MA20·60 야간 분석·과거 검증</div>${S.ma.jobs.map(j => `<div class="sm">${dot(j.ok ? 'ok' : j.ok === false ? 'fail' : 'warn')} ${tm(j.started)} ${esc(j.job)} ${j.as_of ? esc(j.as_of.slice(0, 10)) : ''} ${j.ok == null ? '<span class="c-warn">진행 중/미완료</span>' : ''} ${j.error ? '<span class="c-fail">' + esc(j.error.slice(-90)) + '</span>' : ''}</div>`).join('')}` : ''}
       <div class="sm mut" style="margin-top:10px">Kell 장중 엔진</div><div class="sm">${K.engine.d ? `${esc(K.engine.d.slice(0, 10))} · 마지막 신호 ${tm(K.engine.last_beat)} · ${K.engine.beats}회` : '기록 없음'}</div>
-      <div class="note">Jones 서버 재시작 24시간 ${J.restarts24}회 · 대시보드 ntfy ${S.ntfy ? '<span class="pos">연결</span> <button class="btn sm" id="ntfyTest">테스트 발송</button>' : '<span class="c-warn">미설정 (NTFY_TOPIC)</span>'}</div></div>
+      <div class="note">Kell ntfy 24시간 발송 ${K.ntfy?.n ?? 0}건 · 실패 ${K.ntfy?.bad ?? 0}건 · Jones 서버 재시작 24시간 ${J.restarts24}회 · 대시보드 ntfy ${S.ntfy ? '<span class="pos">연결</span> <button class="btn sm" id="ntfyTest">테스트 발송</button>' : '<span class="c-warn">미설정 (NTFY_TOPIC)</span>'}</div></div>
     <div class="card"><h2>최근 해제된 문제 (48시간)</h2>${(S.resolved || []).length ? S.resolved.map(r => `<div class="sm">${dot('ok')} <span class="sev ${r.severity}">${r.severity}</span> ${esc(r.title)} <span class="mut">· ${tm(r.first_seen)} 발생 → ${tm(r.resolved_at)} 해제${r.acked_at ? ' · 확인함' : ''}</span></div>`).join('') : '<div class="empty">없음</div>'}
       <h2 style="margin-top:14px">현재 문제 전체</h2>${issueList(S.issues || [], true)}</div>
   </div>
@@ -416,6 +430,9 @@ async function showReport(d) {
         <span class="k">실현 순손익</span><span>${v(Ro.realized, usd)}</span><span class="k">미확인 주문</span><span>${Ro.unknown_orders}건</span><span class="k">누적</span><span>${Ro.cum_n || 0}건 · ${usd(Ro.cum_net)}</span></div></div>
       <div><div class="mid">3. 수일 매매 — Kell (${esc(Ke.mode)})</div><div class="kv" style="margin-top:6px"><span class="k">보유 종목</span><span>${Ke.holdings}개</span><span class="k">신규 진입</span><span>${v(Ke.entries)}건</span>
         <span class="k">실현 순손익</span><span>${v(Ke.realized, usd)}</span><span class="k">평가손익</span><span>${v(Ke.unrealized, usd)}</span><span class="k">다음 감시</span><span>${v(Ke.watch_live)}종목 (스캔 ${esc(Ke.scan_as_of || '—')})</span></div></div>
+      ${r.jones_etf ? `<div><div class="mid">1b. ETF 200일 운용 — Jones E (${esc(r.jones_etf.mode || '—')})</div><div class="kv" style="margin-top:6px"><span class="k">보유</span><span>${r.jones_etf.holdings}개</span>
+        <span class="k">실현 순손익</span><span>${v(r.jones_etf.realized, usd)}</span><span class="k">장 마감 점검 이상</span><span>${(r.jones_etf.bad_checks || []).length ? r.jones_etf.bad_checks.map(esc).join(', ') : '없음'}</span>
+        <span class="k">가상 운용 A·B·C</span><span>${(r.jones_etf.paper || []).map(a => esc((a.name || '').split(' ')[0]) + ' ' + pct(a.ret_pct, 2)).join(' / ') || '—'}</span></div></div>` : ''}
       ${r.ma ? `<div><div class="mid">3b. 추세 매매 — MA20·60 (${esc(r.ma.mode || '—')})</div><div class="kv" style="margin-top:6px"><span class="k">보유 종목</span><span>${r.ma.holdings}개</span><span class="k">신규 진입</span><span>${v(r.ma.entries)}건</span>
         <span class="k">실현 순손익</span><span>${v(r.ma.realized, usd)}</span><span class="k">평가손익</span><span>${v(r.ma.unrealized, usd)}</span><span class="k">신호 / 매수 가능</span><span>${v(r.ma.signals)} / ${v(r.ma.buyable)} · 진입 대기 ${r.ma.watch}종목</span>
         <span class="k">과거 검증 승인</span><span>${Object.entries(r.ma.research_pass || {}).map(([k, p]) => k + (p ? ' 통과' : ' 미통과')).join(' · ') || '—'}</span></div></div>` : ''}

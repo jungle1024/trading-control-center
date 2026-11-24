@@ -210,7 +210,74 @@ def assess_jones(J: dict, h: dict, ctx: Ctx) -> dict:
             iss.append(issue(app, "P2", "stale", "Jones 시장분석 지연", f"최신 확정 {md} · 기대 {exp} · {late_h:.0f}시간 경과", url + "/#records"))
         else:
             ana = lv("warn", f"확정 계산 대기 (기대 {exp})")
-    stat = {"server": srv, "data": data, "analysis": ana, "trade": lv("na", "매매 없음(분석 전용)")}
+    # 거래: ETF 200일 자동매매 엔진(계좌 E, 한국투자 모의투자) — 2026-11-24 추가
+    eng = J.get("engine") or {}
+    emode = eng.get("mode", "off")
+    emode_name = {"off": "꺼짐", "paper": "가상", "live": "실매매(한국투자 모의)"}.get(emode, emode)
+    is_live = emode == "live"
+    otext = str(b.get("orders") or "")
+    tr = []
+    if emode == "off":
+        tr.append(lv("idle", "ETF 200일 엔진 꺼짐 — 분석만"))
+    else:
+        lt = b.get("live_engine")
+        age = None
+        if lt:
+            try:
+                age = (ctx.now - datetime.fromisoformat(str(lt))).total_seconds()
+            except ValueError:
+                age = None
+        if b and (age is None or age > 180):
+            tr.append(lv("fail", "ETF 엔진 루프 신호 없음" + (f" — {int(age)}초 전" if age else "")))
+            iss.append(issue(app, "P1" if is_live else "P2", "engine", "Jones ETF 엔진 루프 정지 의심", f"엔진 마지막 신호 {lt or '없음'}", url + "/#run"))
+        elif b:
+            tr.append(lv("ok", f"ETF 엔진 {emode_name} · {int(age)}초 전 신호"))
+        if is_live and b and ("미연결" in otext or "스위치 꺼짐" in otext):
+            tr.append(lv("fail", otext))
+            iss.append(issue(app, "P1", "broker", "Jones 실매매 모드인데 주문 불가", otext, url + "/#run"))
+    rep = J.get("live_rep") or {}
+    bad_checks = [c for c in (rep.get("checks") or []) if c.get("ok") is False]
+    unknown = sum(o["n"] for o in J.get("porders") or [] if o["mode"] == "live" and o["code"] == "unknown")
+    if emode != "off" and bad_checks:
+        halt = [c["name"] for c in bad_checks if "대사" in c["name"]]
+        tr.append(lv("fail" if halt else "warn", f"{iso(rep.get('d'))[:10]} 리포트 점검 이상 {len(bad_checks)}건"))
+        iss.append(issue(app, "P1" if (halt and is_live) else "P2", f"live_rep:{iso(rep.get('d'))[:10]}",
+                         "Jones 실매매 자동 정지(대사 실패)" if (halt and is_live) else "Jones ETF 엔진 장 마감 점검 이상",
+                         " · ".join(c["name"] + (": " + "; ".join(map(str, c.get("detail") or []))[:80] if c.get("detail") else "") for c in bad_checks), url + "/#run"))
+    if unknown:
+        tr.append(lv("fail", f"주문 접수 불확실 {unknown}건"))
+        iss.append(issue(app, "P1", "order_unknown", "Jones 주문 접수 불확실(실매매 신규 매수 정지)", f"{unknown}건 — 체결내역·잔고 확인 필요", url + "/#run"))
+    ebook = [p for p in J.get("live_pos") or [] if p["mode"] == emode]
+    trd = max(tr, key=lambda x: LV_ORDER[x["level"]]) if tr else lv("ok", f"ETF 엔진 {emode_name} · 보유 {len(ebook)}")
+    stat = {"server": srv, "data": data, "analysis": ana, "trade": trd}
+    # 계좌 E 성과·보유 (평가가는 앱 장부에만 있으므로 DB에서는 진입가·손절만)
+    etr = [t for t in J.get("live_trades") or [] if t["mode"] == emode]
+    def _row(t):
+        ed = _d(t["exit_d"]); sd = _d(t["entry_d"])
+        return {"pnl": t["pnl"], "r": t["r"], "exit_ts": datetime.combine(ed, datetime.min.time(), UTC).timestamp() if ed else None,
+                "hold_s": (ed - sd).days * 86400 if ed and sd else None}
+    budget = eng.get("budget")
+    e_cum = perf([_row(t) for t in etr], budget)
+    if e_cum.get("avg_hold_s") is not None:
+        e_cum["avg_hold_days"] = round(e_cum["avg_hold_s"] / 86400, 1)
+    e_day = round(sum(t["pnl"] or 0 for t in etr if _d(t["exit_d"]) == ctx.basis), 2)
+    e_pos = [{"app": app, "account": "한국투자 모의(Jones E)" if is_live else "Jones E 가상", "symbol": p["symbol"], "qty": p["qty"],
+              "entry": p["entry"], "last": None, "stop": p["stop"], "unreal": None,
+              "risk_to_stop": r2((p["entry"] - p["stop"]) * p["qty"]) if p["entry"] and p["stop"] else None,
+              "days": (ctx.today - _d(p["opened"])).days if _d(p["opened"]) else None, "kind": "ETF 200일 규칙",
+              "protected": bool(p["stop"]), "status": "보유"} for p in ebook]
+    pa = J.get("paper") or {}
+    paper = [{"key": k, "name": v.get("name"), "equity": (v.get("book") or {}).get("equity"), "ret_pct": (v.get("stats") or {}).get("ret_pct"),
+              "open_n": v.get("open_n"), "trades": (v.get("stats") or {}).get("trades"), "win_rate": (v.get("stats") or {}).get("win_rate"),
+              "mdd_pct": (v.get("stats") or {}).get("mdd_pct"), "month_pct": (v.get("book") or {}).get("month_pct"),
+              "month_blocked": (v.get("book") or {}).get("month_blocked"), "open_risk_pct": (v.get("book") or {}).get("open_risk_pct"),
+              "as_of": (v.get("book") or {}).get("as_of")} for k, v in sorted((pa.get("accts") or {}).items())]
+    etf = {"mode": emode, "mode_name": emode_name, "live": is_live, "budget": budget, "max_order": eng.get("max_order"), "etfs": eng.get("etfs"),
+           "broker": otext, "changed_at": iso(J.get("engine_at")), "cum": e_cum, "day_realized": e_day, "positions": e_pos,
+           "report": {"d": iso(rep.get("d"))[:10] if rep.get("d") else None, "bad": [c["name"] for c in bad_checks],
+                      "n_checks": len(rep.get("checks") or [])} if rep else None,
+           "orders14": {"ok": sum(o["n"] for o in J.get("porders") or [] if o["ok"]), "fail": sum(o["n"] for o in J.get("porders") or [] if o["ok"] is False)},
+           "paper": paper, "paper_start": pa.get("start")}
 
     # 시장 판단
     market = None
@@ -300,8 +367,8 @@ def assess_jones(J: dict, h: dict, ctx: Ctx) -> dict:
     return {"app": app, "status": stat, "overall": worst(*stat.values()), "market": market, "provisional": provisional,
             "discover": discover, "kpi": kpi, "runs": [{**r, "started_at": iso(r["started_at"]), "finished_at": iso(r["finished_at"]),
                                                        "d": iso(r["d"])} for r in runs[:5]],
-            "restarts24": J.get("restarts24"), "alerts_bad": len(bad_alerts), "issues": iss,
-            "headline": stat["analysis"]["text"]}
+            "restarts24": J.get("restarts24"), "alerts_bad": len(bad_alerts), "etf": etf, "positions": e_pos,
+            "issues": iss, "headline": stat["analysis"]["text"]}
 
 
 # ───────────────────────── 로스
@@ -558,6 +625,9 @@ def assess_kell(K: dict, h: dict, ctx: Ctx, acct: dict | None) -> dict:
         tr.append(lv("fail", f"주문 상태 불명 {len(stuck)}건"))
         iss.append(issue(app, "P1", "order_unknown", "Kell 주문 상태 불명(체결 확인 누락)",
                          ", ".join(f"{o['symbol']} {o['side']} {o['qty']} ({o['status']})" for o in stuck[:5]), url + "/#/orders"))
+    al = K.get("alerts24") or {}
+    if al.get("bad"):
+        iss.append(issue(app, "P3", "ntfy_fail", f"Kell 휴대폰 알림 발송 실패 {al['bad']}건(24h)", "", url + "/#/system"))
     trd = max(tr, key=lambda x: LV_ORDER[x["level"]]) if tr else lv("ok", f"{mode_name} 모드 · 보유 {len(pos)}건")
     stat = {"server": srv, "data": data, "analysis": ana, "trade": trd}
 
@@ -609,7 +679,7 @@ def assess_kell(K: dict, h: dict, ctx: Ctx, acct: dict | None) -> dict:
             "basis": ctx.basis.isoformat(), "market": {**K["market"], "as_of": iso(K["market"]["as_of"])[:10]} if K.get("market") else None,
             "watch": [{**w, "for_date": iso(w["for_date"])[:10], "earnings": iso(w["earnings"])} for w in watch],
             "funnel": funnel, "cum": cum, "day_realized": day_real, "unrealized": round(unreal, 2), "positions": plist,
-            "account": account, "shadow": K.get("shadow"),
+            "account": account, "shadow": K.get("shadow"), "ntfy": {"configured": b.get("ntfy") if b else None, **(al or {})},
             "jobs": [{**j, "started": iso(j["started"]), "finished": iso(j["finished"]), "as_of": iso(j["as_of"])} for j in jobs[:6]],
             "engine": {"d": iso(eng["d"]) if eng else None, "last_beat": iso(eng["last_beat"]) if eng else None, "beats": eng["beats"] if eng else None},
             "issues": iss, "headline": stat["analysis"]["text"]}
@@ -730,8 +800,17 @@ def assess_ma(M: dict, h: dict, ctx: Ctx, acct: dict | None) -> dict:
         cum["avg_hold_days"] = round(cum["avg_hold_s"] / 86400, 1)
     day_closed = [p for p in closed if p["closed_at"] and p["closed_at"].astimezone(ET).date() == ctx.basis]
     day_real = round(sum(row(p)["pnl"] for p in day_closed), 2)
-    # 보유 — 실시간 평가는 앱 장부 API(비밀번호 설정 시), 없으면 DB 값만
+    # 보유 — 실시간 평가는 앱 장부 API(비밀번호 설정 시), 없으면 최근 장 마감 리포트의 종가
     live_px = {p["symbol"]: p for p in (bk or {}).get("open") or []}
+    mrep = M.get("report") or {}
+    px_src = "실시간" if live_px else None
+    if not live_px and mrep.get("book") == book:
+        live_px = {h["symbol"]: {"price": h.get("close")} for h in mrep.get("holdings") or [] if h.get("close")}
+        px_src = f"{iso(mrep.get('day'))[:10]} 종가" if live_px else None
+    rep_issues = mrep.get("issues") or []
+    if rep_issues:
+        iss.append(issue(app, "P3", f"rep_issue:{iso(mrep.get('day'))[:10]}", f"MA20·60 장 마감 리포트 이상 분류 {len(rep_issues)}건",
+                         " · ".join(f"{x.get('class')}: {x.get('detail')}" for x in rep_issues)[:200], url + "/#today"))
     unreal, plist = 0.0, []
     for p in mypos:
         lp = live_px.get(p["symbol"]) or {}
@@ -775,7 +854,10 @@ def assess_ma(M: dict, h: dict, ctx: Ctx, acct: dict | None) -> dict:
             "basis": ctx.basis.isoformat(), "settings": {k: st.get(k) for k in ("equity", "risk_rate", "max_positions", "max_new_per_day", "max_order_usd", "type_status")},
             "market": {"as_of": iso(m.get("as_of"))[:10] if m.get("as_of") else None, "SPY": md.get("SPY"), "QQQ": md.get("QQQ"), "breadth": md.get("breadth")},
             "watch": [{**w, "for_date": iso(w["for_date"])[:10]} for w in watch], "funnel": funnel, "cum": cum, "day_realized": day_real,
-            "unrealized": round(unreal, 2) if live_px else None, "positions": plist, "account": account, "research": research,
+            "unrealized": round(unreal, 2) if live_px else None, "unreal_src": px_src, "positions": plist,
+            "report": {"day": iso(mrep.get("day"))[:10] if mrep.get("day") else None, "issues": rep_issues, "perf": mrep.get("perf")} if mrep else None,
+            "version": {"vid": (M.get("version") or {}).get("vid"), "purpose": (M.get("version") or {}).get("purpose"),
+                        "since": iso((M.get("version") or {}).get("activated_at"))}, "targets": M.get("targets"), "account": account, "research": research,
             "loss_limit": {"limit": round(equity * MA_DAY_LOSS, 2) if equity else None, "used_pct": loss_use, "realized": day_real},
             "jobs": [{**j, "started": iso(j["started"]), "finished": iso(j["finished"]), "as_of": iso(j["as_of"])} for j in jobs[:6]],
             "protect_n": M.get("protect_n"), "issues": iss, "headline": stat["analysis"]["text"]}
@@ -789,7 +871,7 @@ def tm_short(x):
 # ───────────────────────── 통합 위험
 def assess_risk(J: dict, R: dict, K: dict, M: dict, acct: dict | None) -> dict:
     iss = []
-    pos = (R.get("positions") or []) + (K.get("positions") or []) + (M.get("positions") or [])
+    pos = (R.get("positions") or []) + (K.get("positions") or []) + (M.get("positions") or []) + ((J or {}).get("positions") or [])
     other = R.get("other_holdings") or []
     syms = {}
     for p in pos + other:
@@ -798,7 +880,7 @@ def assess_risk(J: dict, R: dict, K: dict, M: dict, acct: dict | None) -> dict:
     if dup:
         iss.append(issue("DASH", "P3", "dup", "여러 계좌 동일 종목 보유", ", ".join(dup)))
     m = (J or {}).get("market") or {}
-    trade_apps = (R, K, M)
+    trade_apps = (J, R, K, M)
     unknown = sum(1 for x in trade_apps for i in (x.get("issues") or []) if "불명" in i["title"] or "미청산" in i["title"])
     stale = sum(1 for x in (J, R, K, M) for i in (x.get("issues") or []) if any(w in i["title"] for w in ("지연", "데이터", "미생성")))
     risk_to_stop = round(sum(p.get("risk_to_stop") or 0 for p in pos), 2)
@@ -812,6 +894,9 @@ def assess_risk(J: dict, R: dict, K: dict, M: dict, acct: dict | None) -> dict:
          "source": ka.get("source"), "capital": ka.get("capital_setting"), "cash": ka.get("cash_usd"),
          "realized_today": K.get("day_realized"), "unreal": K.get("unrealized"), "open": len(K.get("positions") or []),
          "error": ka.get("error")},
+        {"name": "한국투자 모의투자 (Jones E)" + " · " + (((J or {}).get("etf") or {}).get("mode_name") or "꺼짐"), "live": False,
+         "source": "ETF 200일 엔진 예산(모의투자 — 실제 돈 아님)", "capital": ((J or {}).get("etf") or {}).get("budget"), "cash": None,
+         "realized_today": ((J or {}).get("etf") or {}).get("day_realized"), "unreal": None, "open": len((J or {}).get("positions") or []), "error": None},
         {"name": "키움증권 (MA20·60)" + ("" if m_live else " · " + (M.get("mode_name") or "")), "live": m_live,
          "source": ma.get("source"), "capital": ma.get("capital_setting"), "cash": ma.get("orderable_usd", ma.get("cash_usd")),
          "realized_today": M.get("day_realized"), "unreal": M.get("unrealized"), "open": len(M.get("positions") or []),

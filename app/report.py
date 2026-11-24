@@ -17,6 +17,9 @@ def build(d, snap: dict) -> dict:
         "Jones 시장분석": m.get("d") == ds,
         "Ross 체결 동기화(장 마감 리포트)": bool((R.get("report") or {}).get("exists")) and R.get("basis") == ds,
         "Kell 야간 스캔·잔고": K["status"]["analysis"]["level"] == "ok" and (K.get("funnel") or {}).get("scan_as_of") == ds,
+        **({"Jones ETF 엔진 장 마감 리포트": ((J.get("etf") or {}).get("report") or {}).get("d") == ds}
+           if (J.get("etf") or {}).get("mode", "off") != "off" else {}),
+        **({"MA20·60 장 마감 리포트": ((M.get("report") or {}).get("day") == ds)} if M.get("mode") not in (None, "research") else {}),
         "MA20·60 야간 분석": (M.get("status") or {}).get("analysis", {}).get("level") == "ok" and (M.get("funnel") or {}).get("as_of") == ds,
         "전 앱 상태 수집": all(x["status"]["server"]["level"] != "fail" for x in (J, R, K, M) if x.get("status")),
         "손익·위험 계산": True,
@@ -54,6 +57,9 @@ def build(d, snap: dict) -> dict:
              "research_pass": {k: v.get("pass") for k, v in ((M.get("research") or {}).get("kinds") or {}).items()}}
     return {
         "date": ds, "status": status, "conditions": conds, "session": tcal.is_session(d),
+        "jones_etf": {"mode": (J.get("etf") or {}).get("mode_name"), "holdings": len(J.get("positions") or []),
+                      "realized": (J.get("etf") or {}).get("day_realized"), "bad_checks": ((J.get("etf") or {}).get("report") or {}).get("bad"),
+                      "paper": [{"name": a["name"], "equity": a["equity"], "ret_pct": a["ret_pct"], "open_n": a["open_n"]} for a in (J.get("etf") or {}).get("paper") or []]},
         "jones": {"stage": m.get("stage"), "name": m.get("name"), "change": m.get("change"), "warnings": len(m.get("warnings") or []),
                   "new_candidates": (J.get("discover") or {}).get("new"), "candidates": (J.get("discover") or {}).get("n"),
                   "defense": m.get("defense"), "market_d": m.get("d")},
@@ -75,6 +81,9 @@ def to_text(r: dict) -> str:
              f"1) Jones: {v(J['name'])} · 전일 대비 {v(J['change'])} · 경보 {J['warnings']} · 후보 {v(J['candidates'])}(신규 {v(J['new_candidates'])})",
              f"2) Ross: 청산 {v(Ro['closed'])}건 · 승률 {v(Ro['win_rate'], '{}%', '-')} · 실현 {v(Ro['realized'], '${:+.2f}')} · 미확인 주문 {Ro['unknown_orders']}건",
              f"3) Kell({Ke['mode']}): 보유 {Ke['holdings']} · 신규 {v(Ke['entries'])} · 실현 {v(Ke['realized'], '${:+.2f}')} · 평가 {v(Ke['unrealized'], '${:+.2f}')}",
+             (f"1b) Jones ETF 200일({r['jones_etf']['mode']}): 보유 {r['jones_etf']['holdings']} · 실현 {v(r['jones_etf']['realized'], '${:+.2f}')}"
+              + (" · 가상 운용 " + " / ".join(f"{a['name'].split(' ')[0]} {a['ret_pct']:+.2f}%" for a in r['jones_etf']['paper'] if a.get('ret_pct') is not None) if r['jones_etf'].get('paper') else "")
+              if r.get("jones_etf") else "1b) Jones ETF: 미수신"),
              (f"3b) MA20·60({r['ma']['mode']}): 보유 {r['ma']['holdings']} · 신호 {v(r['ma']['signals'])} · 매수 가능 {v(r['ma']['buyable'])} · 진입 대기 {r['ma']['watch']} · 실현 {v(r['ma']['realized'], '${:+.2f}')}" if r.get("ma") else "3b) MA20·60: 미수신"),
              f"4) 위험: 실매매 실현 합계 {v(Ri['realized_total_live'], '${:+.2f}')} · 손실한도 초과 {Ri['loss_limit_breach']} · 미해결 장애 {Ri['incidents_open']}",
              "5) 다음 거래일: " + " / ".join(r["next"][:4])]

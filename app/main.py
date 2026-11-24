@@ -20,7 +20,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 
 from app import assess, db, report, sources, store, tcal
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 DASH_PASSWORD = os.environ.get("DASH_PASSWORD", "")
 SESSION_SECRET = os.environ.get("SESSION_SECRET", "tcc-dev-secret")
 INTERVAL = int(os.environ.get("COLLECT_INTERVAL_S", "60"))
