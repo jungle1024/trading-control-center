@@ -20,7 +20,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 
 from app import assess, db, report, sources, store, tcal
 
-VERSION = "2.0.1"
+VERSION = "2.1.0"
 DASH_PASSWORD = os.environ.get("DASH_PASSWORD", "")
 SESSION_SECRET = os.environ.get("SESSION_SECRET", "tcc-dev-secret")
 INTERVAL = int(os.environ.get("COLLECT_INTERVAL_S", "60"))
@@ -178,6 +178,7 @@ async def collect():
         errs.append(traceback.format_exc()[-800:])
         SNAP["errors"] = errs
     finally:
+        await asyncio.to_thread(db.close_pools)
         STATE.update(running=False, last_run=time.time(), errors=errs)
 
 
