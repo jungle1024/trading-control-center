@@ -140,6 +140,7 @@ def jones() -> dict:
     alerts = q("select id, at, kind, title, sent, left(err, 200) err from ptj_alerts order by id desc limit 10")
     # ETF 200일 자동매매(계좌 E) · 가상 운용(계좌 A·B·C) — 2026-11-24 추가
     eng = q("select data, updated from ptj_settings where k='live_engine'")
+    disc = q("select data, updated from ptj_settings where k='disc_live'")   # 발굴 A·B·C 모의 주문 스위치(2026-11-25)
     live_pos = q("""select mode, symbol, (data->>'qty')::float qty, (data->>'entry')::float entry, (data->>'stop')::float stop,
                            data->>'opened' opened, data->>'cond_id' cond_id, updated from ptj_live_pos""")
     live_trades = q("""select id, mode, symbol, entry_d, exit_d, (data->>'pnl')::float pnl, (data->>'r')::float r, data->>'why' why
@@ -154,7 +155,7 @@ def jones() -> dict:
                  from ptj_settings where k='paper_live'""")
     return {"engine": (eng[0]["data"] if eng else None) or {"mode": "off"}, "engine_at": eng[0]["updated"] if eng else None,
             "live_pos": live_pos, "live_trades": live_trades, "live_rep": live_rep[0] if live_rep else None, "porders": porders,
-            "paper": paper[0] if paper else None,
+            "paper": paper[0] if paper else None, "disc_live": disc[0]["data"] if disc else {},
             "market": mk[0] if mk else None, "provisional": prov[0] if prov else None, "history": hist, "runs": runs,
             "cand_d": d, "candidates": cands, "prev_syms": prev_syms, "outcomes": oc[0] if oc else {},
             "alert_eval": ae[0] if ae else None, "events": ev, "restarts24": restarts[0]["n"] if restarts else 0, "alerts": alerts}
@@ -239,7 +240,7 @@ def kell() -> dict:
 
 
 def ma() -> dict:
-    st = {r["k"]: r["data"] for r in q("select k, data from mt_settings where k='main'")}
+    st = {r["k"]: r["data"] for r in q("select k, data from mt_settings where k in ('main', 'live_block')")}
     jobs = q("""(select id, job, started, finished, ok, as_of, left(error, 300) error, stats->'kinds' kinds, stats->'signals' signals,
                         stats->'buyable' buyable, stats->'watch' watch, stats->'approval' approval
                  from mt_jobs where job='nightly' order by id desc limit 6)
@@ -310,7 +311,8 @@ def v5() -> dict:
                      from v5_alerts where at > now() - interval '24 hours'""")
     ver = q_v5("select id, label, status, activated_at, left(reason, 200) reason from v5_versions where status='active' order by id desc limit 1")
     rev = q_v5("select d, data->'perf' perf from v5_reviews where kind='daily' order by d desc limit 1")
+    kis_ev = q_v5("""select at, left(msg, 300) msg from v5_events where kind='broker' and msg like 'KIS 점검%%' order by id desc limit 1""")
     return {"settings": st, "heartbeat": hb, "regime": reg[0] if reg else None, "cand_d": cd[0]["d"] if cd else None, "cands": cands,
             "positions": pos, "trades": trades, "intents": intents, "orders": orders, "report": rep[0] if rep else None,
             "equity": eq, "ev24": evc, "nightly": nightly[0] if nightly else None, "alerts24": alerts[0] if alerts else {},
-            "version": ver[0] if ver else None, "review": rev[0] if rev else None}
+            "version": ver[0] if ver else None, "review": rev[0] if rev else None, "kis_check": kis_ev[0] if kis_ev else None}

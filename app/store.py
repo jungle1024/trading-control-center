@@ -259,6 +259,33 @@ async def topic_check() -> str:
     return "발송"
 
 
+# ───────────────────────── 연결 증권 계좌 변경 감지
+async def broker_changes(fps: dict, rows: list[dict]) -> list[dict]:
+    """앱별 계좌 지문이 이전과 다르면 이벤트 기록 + ntfy. 처음 본 앱은 기준만 저장(알림 없음)."""
+    from app import brokers
+    if not fps:
+        return []
+    prev = {r["src"][5:]: r["last_id"] for r in q("select src, last_id from dash_cursor where src like 'acct:%%'")}
+    out = []
+    for app, fp in fps.items():
+        if prev.get(app) == fp:
+            continue
+        mine = [x for x in rows if x["app"] == app]
+        text = brokers.summary(mine)
+        with rw() as cur:
+            cur.execute("""insert into dash_cursor(src, last_id, updated) values(%s, %s, now())
+                           on conflict (src) do update set last_id=excluded.last_id, updated=now()""", (f"acct:{app}", fp))
+            if app in prev:
+                cur.execute("""insert into dash_events(event_id, at, app, kind, severity, msg, status) values(%s, now(), %s, '증권 계좌 변경', 'P2', %s, 'warn')
+                               on conflict do nothing""", (f"{app}:acct:{fp}", app, f"연결 계좌 변경 감지 → {text}"))
+        if app in prev:
+            name = mine[0]["app_name"] if mine else app
+            err = await send(f"🔁 {name} 연결 증권 계좌 변경", f"현재: {text}\n의도한 변경인지 확인하세요. 대시보드 「포트폴리오·위험」 탭에 반영됨.",
+                             priority=4, tags=["arrows_counterclockwise"])
+            out.append({"app": app, "text": text, "notify_err": err})
+    return out
+
+
 # ───────────────────────── 재배포 겹침 방지
 # Render 무중단 배포 때 옛 인스턴스와 새 인스턴스가 1~2분 함께 돈다. 가장 늦게 시작한 인스턴스만
 # 문제 판정·알림·보고서를 맡는다(옛 인스턴스가 문제를 열고 닫아 알림이 반복되던 현상 방지).

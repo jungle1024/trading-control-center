@@ -18,9 +18,9 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 
-from app import assess, db, report, sources, store, tcal
+from app import brokers, assess, db, report, sources, store, tcal
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 DASH_PASSWORD = os.environ.get("DASH_PASSWORD", "")
 SESSION_SECRET = os.environ.get("SESSION_SECRET", "tcc-dev-secret")
 INTERVAL = int(os.environ.get("COLLECT_INTERVAL_S", "60"))
@@ -137,6 +137,15 @@ async def collect():
         av = safe(assess.assess_v5, V, ev5, "V5", acct) if db.V5_DATABASE_URL else assess.v5_unlinked(health.get("V5"))
         risk = assess.assess_risk(aj, ar, ak, am, acct, av)
         issues = aj["issues"] + ar["issues"] + ak["issues"] + am["issues"] + av["issues"] + risk["issues"]
+        # 연결 증권 계좌 — 매 주기 앱 /health·계좌 조회·DB 설정에서 다시 만든다(앱에서 계좌가 바뀌면 같이 바뀜)
+        broker_rows = brokers.build(health, acct, {"ROSS": ar, "KELL": ak, "MA": am, "JONES": aj, "V5": av},
+                                    {"ROSS": R, "KELL": K, "MA": M, "JONES": J, "V5": V})
+        for r in risk["accounts"]:            # 계좌 표의 이름도 실제 연결 계좌에서
+            mine = [x for x in broker_rows if x["app"] == r.get("app")]
+            main_ = next((x for x in mine if x["kind"] in ("실매매", "모의투자")), mine[0] if mine else None)
+            if main_ and main_["broker"] != "—":
+                r["name"] = f"{main_['broker']} {main_['acct_type']} ({main_['app_name']})" + (f" · {main_['kind']}" if main_["kind"] not in ("실매매",) else "")
+                r["live"] = main_["kind"] == "실매매" and r.get("live", True)
         if storage:
             disk = DB_DISK_GB * 1024 ** 3
             storage.update(disk=disk, used_pct=round(storage["total"] / disk * 100, 1))
@@ -156,6 +165,10 @@ async def collect():
             if await asyncio.to_thread(store.is_leader, STATE["started_ms"]):
                 changes = await asyncio.to_thread(store.sync_issues, issues)
                 await store.notify(changes)
+                try:
+                    STATE["broker_changes"] = await store.broker_changes(brokers.fingerprints(broker_rows, acct), broker_rows)
+                except Exception as e:
+                    errs.append(f"broker_changes: {type(e).__name__}: {e}")
             else:
                 STATE["standby"] = True  # 재배포 중 새 인스턴스가 떠 있으면 문제 판정·알림은 새 인스턴스에 맡김
             stored = await asyncio.to_thread(store.open_issues)
@@ -177,7 +190,7 @@ async def collect():
                 "jones": aj, "ross": ar, "kell": ak, "ma": am, "v5": av, "risk": risk, "issues": issues,
                 "resolved": [{**r, "first_seen": assess.iso(r["first_seen"]), "resolved_at": assess.iso(r["resolved_at"]),
                               "acked_at": assess.iso(r["acked_at"])} for r in resolved],
-                "ingest": ingest, "errors": errs, "storage": storage, "ntfy": bool(store.NTFY_TOPIC),
+                "ingest": ingest, "errors": errs, "storage": storage, "brokers": broker_rows, "ntfy": bool(store.NTFY_TOPIC),
                 "accounts_linked": {k: bool(os.environ.get(f"{k}_APP_PASSWORD")) for k in ("ROSS", "KELL", "MA")}}
         SNAP.clear()
         SNAP.update(snap)

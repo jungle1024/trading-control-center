@@ -152,6 +152,7 @@ function overview() {
   const appCard = A => { const a = S[A.toLowerCase()], ap = S.apps[A];
     return `<div class="card"><div class="app-hd">${dot(a.overall)}<b>${ap.short}</b><span class="mut sm">${esc(ap.role)}</span><span class="r">${link(A, '', '↗')}</span></div>
       <div class="sm" style="margin-top:8px">${esc(a.headline || '')}</div>
+      ${brokerLine(A)}
       <div class="lvls">${Object.entries(a.status).map(([k, v]) => `<span class="k">${dot(v.level)}${LVK[k]}</span><span class="${v.level === 'fail' ? 'c-fail' : v.level === 'warn' ? 'c-warn' : ''}">${esc(v.text)}</span>`).join('')}</div></div>`; };
   const ll = Rk.loss_limit || {};
   const evs = (EV.rows || []).filter(e => e.severity <= 'P3' && e.kind !== '서버 시작').slice(0, 9);
@@ -388,6 +389,7 @@ function risk() {
       <div class="bar"><i style="width:${Math.min(100, Rk.v5_loss_limit.used_pct || 0)}%;background:${(Rk.v5_loss_limit.used_pct || 0) >= 70 ? 'var(--fail)' : 'var(--ok)'}"></i></div>` : ''}</div>
     <div class="card"><div class="sm mut">시장 위험 (Jones)</div><div class="big ${mk.defense ? 'neg' : ''}">${esc(mk.stage || '—')}</div><div class="xs dim">${esc(mk.name || '')} · Kell 필터 ${esc(mk.kell_regime || '—')} · 20·60 SPY ${esc(mk.ma_spy || '—')} · V5 ${esc(mk.v5_regime || '—')}</div></div>
   </div>
+  ${brokerCard()}
   <div class="card sec"><h2>계좌별 현황</h2><div class="tw"><table><tr><th>계좌</th><th class="n">자본</th><th class="n">주문가능 현금</th><th class="n">당일 실현</th><th class="n">평가손익</th><th class="n">보유</th></tr>${acc}</table></div>
     ${tr ? `<div class="sm" style="margin-top:10px">Ross 시험 운영 누적 손실 한도: ${usd(tr.pnl)} / $${tr.cap} · 사용 ${f(tr.use_pct, 0)}% · 손실일 ${tr.max_loss_days}일 연속 시 중지</div>` : ''}
     ${Object.values(S.accounts_linked).some(v => !v) ? `<div class="note">미연동: ${Object.entries(S.accounts_linked).filter(([k, v]) => !v).map(([k]) => '<b>' + k + '_APP_PASSWORD</b>').join(' · ')} — Render 이 서비스 환경변수에 각 웹앱 로그인 비밀번호를 넣으면 실잔고(MA는 장중 관리 상태·평가손익 포함)가 표시됩니다. 대시보드는 각 앱의 읽기 전용 계좌 조회 GET만 호출하며 주문 API는 호출하지 않습니다.</div>` : ''}</div>
@@ -414,6 +416,31 @@ function rossLogic(R) {
       ${Object.entries(tg).map(([k, t]) => `<tr><td>${per[k] || k}</td><td class="n">${t.target_pct ?? '—'}% (${usd(t.target_usd)})</td><td class="n">${usd(t.pnl)} (${pct(t.ret_pct, 2)})</td><td class="n">${t.achv_pct != null ? t.achv_pct + '%' : '—'}</td><td class="n">${t.days_left ?? '—'}일 · ${usd(t.need_per_day)}</td></tr>`).join('')}</table></div>
       <div class="note">수익 목표는 도전 목표이며 달성 보장이 아닙니다.</div>` : ''}
     <div class="sm" style="margin-top:10px"><b>토스 API 응답</b> ${rt ? `${dot(rt.net_errors_5m >= 3 ? 'fail' : (rt.p95 > 1500 || (rt.order_p95 || 0) > 1500 || rt.net_errors_5m) ? 'warn' : rt.n ? 'ok' : 'idle')} ${esc(rt.text)}${rt.last_ms != null ? ` <span class="mut">· 마지막 ${esc(rt.last_kind || '')} ${rt.last_ms}ms (${Math.round(rt.last_age_s)}초 전)</span>` : ''}` : '<span class="dim">미수신</span>'}</div>`;
+}
+
+// 연결 증권 계좌 — 서버가 매 수집 주기마다 각 앱 /health·계좌 조회·DB 설정에서 다시 만든 값(앱에서 바꾸면 같이 바뀜)
+const KIND_CLS = {'실매매': 'c-fail', '모의투자': 'c-warn', '승인·대기': 'c-warn', '연결만': 'mut', '미연결': 'dim', '확인 실패': 'c-fail', '확인 불가': 'c-warn'};
+function brokerLine(A) {
+  const rows = (S.brokers || []).filter(x => x.app === A);
+  if (!rows.length) return '';
+  return `<div class="xs" style="margin-top:6px">계좌 ${rows.map(x => `<b>${esc(x.broker)}</b> ${esc(x.acct_type)}${x.account ? ' ' + esc(x.account) : ''} <span class="${KIND_CLS[x.kind] || ''}">${esc(x.kind)}</span>`).join(' · ')}</div>`;
+}
+function brokerCard() {
+  const rows = S.brokers || [];
+  if (!rows.length) return '';
+  const yn = v => v === true ? '<span class="pos">켜짐</span>' : v === false ? '<span class="mut">꺼짐</span>' : '<span class="dim">—</span>';
+  const cn = v => v === true ? dot('ok') + '정상' : v === false ? dot('fail') + '<span class="c-fail">이상</span>' : '<span class="dim">—</span>';
+  const NAME = {ROSS: 'Ross', KELL: 'Kell', MA: 'MA20·60', JONES: 'Jones', V5: 'V5'};
+  return `<div class="card sec"><h2>연결 증권 계좌 <span class="r xs">${S.built_at ? tm(S.built_at) + ' 기준 · 매 수집 주기 갱신' : ''}</span></h2>
+    <div class="tw"><table><tr><th>앱</th><th>증권사</th><th>계좌 구분</th><th>계좌</th><th>사용</th><th>용도</th><th>연결</th><th>주문</th><th class="n">주문가능</th><th class="n">증권사 보유</th></tr>
+    ${rows.map(x => `<tr><td><b>${NAME[x.app] || esc(x.app)}</b></td><td>${esc(x.broker)}${x.label ? ` <span class="xs mut">${esc(x.label)}</span>` : ''}</td>
+      <td>${x.acct_type === '실계좌' ? '<b>실계좌</b>' : esc(x.acct_type)}</td><td class="sm">${x.account ? esc(x.account) : '<span class="dim">미표시</span>'}</td>
+      <td><b class="${KIND_CLS[x.kind] || ''}">${esc(x.kind)}</b></td><td class="sm">${esc(x.role || '')}${x.note ? `<div class="xs mut">${esc(x.note)}</div>` : ''}<div class="xs dim">${esc(x.source || '')}</div></td>
+      <td class="sm">${cn(x.connected)}</td><td class="sm">${yn(x.trading)}</td>
+      <td class="n">${x.buying_power != null ? '$' + f(x.buying_power) : '—'}</td><td class="n">${x.holdings ?? '—'}</td></tr>`).join('')}</table></div>
+    <div class="note"><b>실매매</b> = 실제 돈 주문 · <b>모의투자</b> = 증권사 모의 계좌 주문(실제 돈 아님) · <b>연결만</b> = 키는 연결됐지만 이 계좌로 주문하지 않음 · <b>승인·대기</b> = 실매매 승인됐지만 모드 전환 전.
+      앱에서 계좌·환경·모드를 바꾸면 다음 수집(약 1분, 잔고는 5분)에 이 표가 바뀌고, 바뀐 순간 이벤트 기록과 ntfy 알림이 갑니다.
+      계좌번호는 각 앱이 /health 에 가린 번호를 내보낼 때만 끝 4자리로 표시합니다(현재 Ross 는 토스 계좌 순번).</div></div>`;
 }
 
 // ─────────────────────────────── Events & Health
