@@ -256,3 +256,18 @@ async def topic_check() -> str:
         cur.execute("""insert into dash_events(event_id, at, app, kind, severity, msg, status) values(%s, now(), 'DASH', '알림 토픽 확인', 'P4', %s, 'info')
                        on conflict do nothing""", (f"DASH:topic:{h}", "알림 토픽 변경 감지 — 확인 메시지 발송 성공"))
     return "발송"
+
+
+# ───────────────────────── 재배포 겹침 방지
+# Render 무중단 배포 때 옛 인스턴스와 새 인스턴스가 1~2분 함께 돈다. 가장 늦게 시작한 인스턴스만
+# 문제 판정·알림·보고서를 맡는다(옛 인스턴스가 문제를 열고 닫아 알림이 반복되던 현상 방지).
+def claim_leader(started_ms: int):
+    with rw() as cur:
+        cur.execute("""insert into dash_cursor(src, last_id, updated) values('leader', %s, now())
+                       on conflict (src) do update set last_id=greatest(dash_cursor.last_id, excluded.last_id), updated=now()""",
+                    (started_ms,))
+
+
+def is_leader(started_ms: int) -> bool:
+    row = q("select last_id from dash_cursor where src='leader'")
+    return not row or row[0]["last_id"] <= started_ms

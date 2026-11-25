@@ -20,7 +20,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 
 from app import assess, db, report, sources, store, tcal
 
-VERSION = "2.0.0"
+VERSION = "2.0.1"
 DASH_PASSWORD = os.environ.get("DASH_PASSWORD", "")
 SESSION_SECRET = os.environ.get("SESSION_SECRET", "tcc-dev-secret")
 INTERVAL = int(os.environ.get("COLLECT_INTERVAL_S", "60"))
@@ -28,7 +28,7 @@ UI = Path(__file__).resolve().parent.parent / "ui"
 
 app = FastAPI(title="Global Trading Control Center", docs_url=None, redoc_url=None)
 SNAP: dict = {"ready": False}
-STATE = {"last_run": 0.0, "running": False, "errors": [], "report_done": None, "lock": None}
+STATE = {"last_run": 0.0, "running": False, "errors": [], "report_done": None, "lock": None, "started_ms": int(time.time() * 1000), "standby": False}
 
 
 # ───────────────────────── 인증
@@ -145,8 +145,11 @@ async def collect():
                     ingest["v5"] = await asyncio.to_thread(store.ingest_v5)
                 except Exception as e:
                     errs.append(f"ingest v5: {type(e).__name__}: {e}")
-            changes = await asyncio.to_thread(store.sync_issues, issues)
-            await store.notify(changes)
+            if await asyncio.to_thread(store.is_leader, STATE["started_ms"]):
+                changes = await asyncio.to_thread(store.sync_issues, issues)
+                await store.notify(changes)
+            else:
+                STATE["standby"] = True  # 재배포 중 새 인스턴스가 떠 있으면 문제 판정·알림은 새 인스턴스에 맡김
             stored = await asyncio.to_thread(store.open_issues)
             resolved = await asyncio.to_thread(store.recent_resolved)
         except Exception as e:
@@ -181,6 +184,8 @@ async def collect():
 async def _maybe_report(ctx: assess.Ctx):
     """결과 확정 시각(마감+3h)부터 다음 거래일 04:00 ET 전까지만 보고서를 만든다(그 뒤엔 기준일이 바뀜)."""
     d = ctx.settled
+    if STATE.get("standby"):
+        return
     if not tcal.is_session(d) or ctx.basis != d or STATE["report_done"] == d:
         return
     try:
@@ -212,6 +217,7 @@ async def loop():
 async def startup():
     try:
         await asyncio.to_thread(db.init)
+        await asyncio.to_thread(store.claim_leader, STATE["started_ms"])
     except Exception as e:
         STATE["errors"].append(f"db init: {e}")
     try:
@@ -228,7 +234,7 @@ async def startup():
 async def health():
     return {"ok": True, "version": VERSION, "ready": SNAP.get("ready", False), "last_run": STATE["last_run"],
             "db": bool(db.DATABASE_URL), "auth": bool(DASH_PASSWORD), "orders": "none (read-only)",
-            "ntfy": bool(store.NTFY_TOPIC), "topic_check": STATE.get("topic_check")}
+            "ntfy": bool(store.NTFY_TOPIC), "topic_check": STATE.get("topic_check"), "standby": STATE.get("standby", False)}
 
 
 @app.get("/")
