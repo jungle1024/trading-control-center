@@ -11,6 +11,7 @@ from app import tcal
 
 def build(d, snap: dict) -> dict:
     J, R, K, M, risk = snap["jones"], snap["ross"], snap["kell"], snap.get("ma") or {}, snap["risk"]
+    V = snap.get("v5") or {}
     ds = d.isoformat()
     m = J.get("market") or {}
     conds = {
@@ -20,6 +21,8 @@ def build(d, snap: dict) -> dict:
         **({"Jones ETF 엔진 장 마감 리포트": ((J.get("etf") or {}).get("report") or {}).get("d") == ds}
            if (J.get("etf") or {}).get("mode", "off") != "off" else {}),
         **({"MA20·60 장 마감 리포트": ((M.get("report") or {}).get("day") == ds)} if M.get("mode") not in (None, "research") else {}),
+        **({"V5 장 마감 리포트·야간 배치": ((V.get("report") or {}).get("d") == ds and (V.get("regime") or {}).get("d") == ds)}
+           if not V.get("unlinked") and V.get("status") else {}),
         "MA20·60 야간 분석": (M.get("status") or {}).get("analysis", {}).get("level") == "ok" and (M.get("funnel") or {}).get("as_of") == ds,
         "전 앱 상태 수집": all(x["status"]["server"]["level"] != "fail" for x in (J, R, K, M) if x.get("status")),
         "손익·위험 계산": True,
@@ -64,6 +67,9 @@ def build(d, snap: dict) -> dict:
                   "new_candidates": (J.get("discover") or {}).get("new"), "candidates": (J.get("discover") or {}).get("n"),
                   "defense": m.get("defense"), "market_d": m.get("d")},
         "ross": sec_r, "kell": sec_k, "ma": sec_m,
+        "v5": {"mode": V.get("mode_name"), "unlinked": bool(V.get("unlinked")), "regime": (V.get("regime") or {}).get("label"),
+               "holdings": len(V.get("positions") or []), "realized": V.get("day_realized"), "cands": V.get("cands_by"),
+               "bad_checks": (V.get("report") or {}).get("bad"), "equity": (V.get("equity") or {}).get("equity")},
         "risk": {"realized_total_live": risk.get("realized_today_live"), "unreal_kell": risk.get("unreal_kell"), "unreal_all": risk.get("unreal_all"),
                  "loss_limit_breach": sum(1 for i in issues if "손실한도 초과" in i["title"]),
                  "incidents_open": len([i for i in issues if i["severity"] in ("P1", "P2")]),
@@ -84,6 +90,8 @@ def to_text(r: dict) -> str:
              (f"1b) Jones ETF 200일({r['jones_etf']['mode']}): 보유 {r['jones_etf']['holdings']} · 실현 {v(r['jones_etf']['realized'], '${:+.2f}')}"
               + (" · 가상 운용 " + " / ".join(f"{a['name'].split(' ')[0]} {a['ret_pct']:+.2f}%" for a in r['jones_etf']['paper'] if a.get('ret_pct') is not None) if r['jones_etf'].get('paper') else "")
               if r.get("jones_etf") else "1b) Jones ETF: 미수신"),
+             (f"3c) V5({r['v5']['mode']}): 시장 {v(r['v5']['regime'])} · 보유 {r['v5']['holdings']} · 실현 {v(r['v5']['realized'], '${:+.2f}')} · 후보 " + (" · ".join(f"{k} {n}" for k, n in sorted((r['v5'].get('cands') or {}).items())) or "없음")
+              if r.get("v5") and not r["v5"].get("unlinked") else "3c) V5: 데이터 미연결"),
              (f"3b) MA20·60({r['ma']['mode']}): 보유 {r['ma']['holdings']} · 신호 {v(r['ma']['signals'])} · 매수 가능 {v(r['ma']['buyable'])} · 진입 대기 {r['ma']['watch']} · 실현 {v(r['ma']['realized'], '${:+.2f}')}" if r.get("ma") else "3b) MA20·60: 미수신"),
              f"4) 위험: 실매매 실현 합계 {v(Ri['realized_total_live'], '${:+.2f}')} · 손실한도 초과 {Ri['loss_limit_breach']} · 미해결 장애 {Ri['incidents_open']}",
              "5) 다음 거래일: " + " / ".join(r["next"][:4])]

@@ -12,6 +12,8 @@ import psycopg2
 import psycopg2.extras
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
+# V5 통합 자동매매는 전용 DB(싱가포르) — 외부 접속 URL 을 사용자가 Render 환경변수로 입력. 읽기 전용 세션으로만 사용.
+V5_DATABASE_URL = os.environ.get("V5_DATABASE_URL", "")
 
 
 class NoDB(Exception):
@@ -19,10 +21,11 @@ class NoDB(Exception):
 
 
 @contextmanager
-def _conn(readonly: bool):
-    if not DATABASE_URL:
+def _conn(readonly: bool, url: str | None = None):
+    url = url or DATABASE_URL
+    if not url:
         raise NoDB("DATABASE_URL 미설정")
-    c = psycopg2.connect(DATABASE_URL, connect_timeout=10, application_name="trading-control-center")
+    c = psycopg2.connect(url, connect_timeout=10, application_name="trading-control-center")
     try:
         c.set_session(readonly=readonly, autocommit=False)
         with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -55,6 +58,15 @@ def rw():
 
 def q(sql: str, args=()) -> list[dict]:
     with ro() as cur:
+        cur.execute(sql, args)
+        return [dict(r) for r in cur.fetchall()]
+
+
+def q_v5(sql: str, args=()) -> list[dict]:
+    """V5 전용 DB — 읽기 전용 트랜잭션."""
+    if not V5_DATABASE_URL:
+        raise NoDB("V5_DATABASE_URL 미설정")
+    with _conn(True, V5_DATABASE_URL) as cur:
         cur.execute(sql, args)
         return [dict(r) for r in cur.fetchall()]
 

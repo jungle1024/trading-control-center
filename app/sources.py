@@ -12,7 +12,7 @@ import time
 
 import httpx
 
-from app.db import q
+from app.db import q, q_v5
 
 APPS = {
     "JONES": {"name": "폴 튜더 존스", "short": "Jones", "role": "시장분석·발굴 + ETF 200일 자동매매(한국투자 모의)",
@@ -21,6 +21,8 @@ APPS = {
              "url": os.environ.get("ROSS_URL", "https://ross-cameron-scanner-zcc5.onrender.com"), "trading": True},
     "KELL": {"name": "올리버 켈", "short": "Kell", "role": "수축 돌파 수일 매매 · 한국투자증권",
              "url": os.environ.get("KELL_URL", "https://kell-contraction-breakout-c8tn.onrender.com"), "trading": True},
+    "V5": {"name": "V5 통합 자동매매", "short": "V5", "role": "A VCP·B 모멘텀·C 20/60 눌림 · 한국투자(KIS) 한 계좌",
+           "url": os.environ.get("V5_URL", "https://v5-integrated-trader-qaei.onrender.com"), "trading": True},
     "MA": {"name": "20·60 이동평균선 추세", "short": "MA20·60", "role": "20·60일선·추세 저항선 돌파 · 키움증권",
            "url": os.environ.get("MA_URL", "https://ma2060-trend-trader-x7oa.onrender.com"), "trading": True},
 }
@@ -253,9 +255,42 @@ def ma() -> dict:
     rep = q("""select day, book, created, data->'issues' issues, data->'holdings' holdings, data->'perf' perf from mt_reports
                order by day desc, created desc limit 1""")
     ver = q("select vid, status, activated_at, purpose from mt_versions where status='active' order by activated_at desc nulls last limit 1")
+    imp = q("""select id, created, status, version, jsonb_array_length(coalesce(summary->'candidates', '[]'::jsonb)) n,
+                      (select count(*) from jsonb_array_elements(coalesce(summary->'candidates', '[]'::jsonb)) c where (c->>'ok')::boolean) passed
+               from mt_improve_runs order by id desc limit 1""")
     tg = q("select data from mt_settings where k='targets'")
     return {"settings": st.get("main") or {}, "jobs": jobs, "market": mk[0] if mk else None, "scan_as_of": sd[0]["d"] if sd else None,
             "scan": scan, "fails": fails, "watch": watch, "pos_open": pos_open, "pos_closed": pos_closed, "orders": orders,
             "locks": locks, "research": research[0] if research else None, "broker": broker[0] if broker else None,
             "errs24": errs[0] if errs else {}, "protect_n": protect[0]["n"] if protect else 0,
-            "report": rep[0] if rep else None, "version": ver[0] if ver else None, "targets": tg[0]["data"] if tg else None}
+            "report": rep[0] if rep else None, "version": ver[0] if ver else None, "improve": imp[0] if imp else None, "targets": tg[0]["data"] if tg else None}
+
+
+def v5() -> dict:
+    """V5 통합 자동매매 — 전용 DB(V5_DATABASE_URL) 읽기 전용."""
+    st = {r["k"]: r["data"] for r in q_v5("select k, data from v5_settings where k in ('modes','capital','risk','restore_point')")}
+    hb = {r["k"]: r for r in q_v5("select k, at, data from v5_heartbeat")}
+    reg = q_v5("select d, data->>'regime' regime, data->>'label' label, data->>'why' why from v5_regime order by d desc limit 1")
+    cd = q_v5("select max(d) d from v5_candidates")
+    cands = []
+    if cd and cd[0]["d"]:
+        cands = q_v5("""select strategy, sym, state, setup, score from v5_candidates where d=%s order by strategy, score desc nulls last""", (cd[0]["d"],))
+    pos = q_v5("""select id, strategy, sym, mode, qty, avg, stop, initial_stop, target, setup, opened_at, state
+                  from v5_positions where closed_at is null order by opened_at""")
+    trades = q_v5("select strategy, sym, mode, setup, opened, closed, pnl, r_mult from v5_trades order by closed")
+    intents = q_v5("""select id, at, et_date, mode, strategy, sym, side, qty, status from v5_intents
+                      where status in ('UNKNOWN','SENT','PARTIAL','SENDING') order by at desc limit 20""")
+    orders = q_v5("""select et_date, mode, ok, count(*) n from v5_orders where at > now() - interval '14 days' group by 1, 2, 3""")
+    rep = q_v5("""select d, kind, final, data->'checks' checks, data->'today' today, created from v5_reports
+                  where kind='eod' order by d desc limit 1""")
+    eq = q_v5("select d, equity, peak, day_pnl from v5_equity order by d desc limit 30")
+    evc = q_v5("""select kind, count(*) n, max(at) last from v5_events where at > now() - interval '24 hours' group by kind""")
+    nightly = q_v5("""select at, left(msg, 200) msg from v5_events where kind='nightly' order by id desc limit 1""")
+    alerts = q_v5("""select count(*) n, count(*) filter (where coalesce(err,'') <> '' or (sent is not null and sent not like 'ntfy:2%%')) bad
+                     from v5_alerts where at > now() - interval '24 hours'""")
+    ver = q_v5("select id, label, status, activated_at, left(reason, 200) reason from v5_versions where status='active' order by id desc limit 1")
+    rev = q_v5("select d, data->'perf' perf from v5_reviews where kind='daily' order by d desc limit 1")
+    return {"settings": st, "heartbeat": hb, "regime": reg[0] if reg else None, "cand_d": cd[0]["d"] if cd else None, "cands": cands,
+            "positions": pos, "trades": trades, "intents": intents, "orders": orders, "report": rep[0] if rep else None,
+            "equity": eq, "ev24": evc, "nightly": nightly[0] if nightly else None, "alerts24": alerts[0] if alerts else {},
+            "version": ver[0] if ver else None, "review": rev[0] if rev else None}

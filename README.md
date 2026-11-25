@@ -1,6 +1,6 @@
 # Global Trading Control Center
 
-미국 주식 전략(폴 튜더 존스[분석 + ETF 200일 자동매매·가상 운용] · 로스 카메론 · 올리버 켈 · 20·60 이동평균선 추세) **통합 운영 대시보드**.
+미국 주식 **5대 전략** 통합 운영 대시보드 — 폴 튜더 존스[분석 + ETF 200일 자동매매·가상 운용] · 로스 카메론 · 올리버 켈 · 20·60 이동평균선 추세 · V5 통합 자동매매(A VCP·B 모멘텀·C 20/60 눌림).
 각 웹앱은 독립적으로 분석·매매하고, 이 앱은 결과만 읽어 **시장 상태 · 앱 가동 상태 · 실제 손익 · 위험 · 조치 필요 사항**을 한 화면에 보여 준다.
 
 ## 설계 원칙 (구축 가이드 V1.0)
@@ -32,7 +32,8 @@
 | `DASH_PASSWORD` | 로그인 비밀번호 (자동 생성 — Render Environment에서 확인) |
 | `NTFY_TOPIC` | 통합 알림 토픽 (선택) |
 | `ROSS_APP_PASSWORD`, `KELL_APP_PASSWORD`, `MA_APP_PASSWORD` | (선택) 증권사 실잔고 조회 — 각 앱의 읽기 전용 GET만 호출. MA는 장중 관리 루프 상태·평가손익도 함께 |
-| `JONES_URL`, `ROSS_URL`, `KELL_URL`, `MA_URL` | 기본값: 현재 Render 주소 |
+| `JONES_URL`, `ROSS_URL`, `KELL_URL`, `MA_URL`, `V5_URL` | 기본값: 현재 Render 주소 |
+| `V5_DATABASE_URL` | V5 전용 DB 외부 접속 URL (읽기 전용으로만 사용) |
 
 ## 새 전략 앱 추가
 `app/sources.py`의 `APPS`에 등록하고 읽기 함수 + `app/assess.py` 판정 함수를 추가한다(같은 4단계·issue 규격).
@@ -48,3 +49,9 @@
 - Jones: ETF 200일 엔진(계좌 E, 한국투자 모의투자) — 모드·엔진 신호(/health live_engine)·장 마감 점검(대사)·불확실 주문·보유·성과, 가상 운용 계좌 A·B·C
 - Kell: ntfy 발송 기록(kc_events alert) 수집·발송 실패 감지
 - MA20·60: 장 마감 리포트(mt_reports) 이상 분류, 보유 평가(종가 기준 대체), 매매법 버전·수익 목표
+
+## v2.0 (2026-11-25) V5 통합 자동매매 추가 — 5대 전략
+- V5 는 **전용 DB(싱가포르 v5-db)** 를 쓴다 → 대시보드 환경변수 `V5_DATABASE_URL` 에 v5-db 의 **External Database URL** 을 넣어야 데이터가 연결된다(읽기 전용 세션). 없으면 /health 만 표시.
+- 판정: 엔진 하트비트(v5_heartbeat) · 야간 배치(거래일 23:15 UTC 크론, 00:15 UTC 이후 지연 판정) · 주문 의도 UNKNOWN/SENT 5분 초과 · 손절가 없는 보유 · 장 마감 안전장치 11개 · 하루 손실·계좌 낙폭 한도
+- 이벤트: v5_events 증분 수집(data_block 은 하루 수백 건이라 개수만 요약)
+- MA20·60: 자동 갱신 검토(mt_improve_runs) 후보·통과 수 표시

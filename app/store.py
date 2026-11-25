@@ -29,10 +29,10 @@ KELL_KIND = {"alert": ("ntfy 발송", "P4"), "error": ("오류", "P2"), "nightly
              "signal": ("매매 신호", "P3"), "candidate": ("신규 후보", "P3")}
 
 
-def _ingest_src(src: str, sql: str, mapper) -> int:
+def _ingest_src(src: str, sql: str, mapper, reader=None) -> int:
     cur_id = q("select last_id from dash_cursor where src=%s", (src,))
     last = cur_id[0]["last_id"] if cur_id else 0
-    rows = q(sql, (last,))
+    rows = (reader or q)(sql, (last,))
     if not rows:
         return 0
     with rw() as cur:
@@ -65,6 +65,25 @@ def _ma(r):
 JONES_EV = {"confirm": ("분석 완료", "P3"), "brief": ("시장 브리핑", "P4"), "error": ("오류", "P2"), "live_mode": ("ETF 엔진 모드", "P3"),
             "live_error": ("ETF 엔진 오류", "P2"), "live_stop": ("비상 손절", "P1"), "live_order": ("ETF 주문", "P2"), "live_fill": ("ETF 체결", "P2"),
             "paper_daily": ("가상 운용 결과", "P4"), "paper_bt": ("가상 운용 백테스트", "P4"), "live_report": ("ETF 장 마감 리포트", "P3")}
+
+
+V5_EV = {"engine": ("엔진", "P3"), "broker": ("KIS 연결", "P4"), "nightly": ("야간 배치", "P4"), "improve": ("자동 갱신", "P3"),
+         "setting": ("설정 변경", "P3"), "replay": ("과거 재현", "P4"), "order": ("주문", "P2"), "fill": ("체결", "P2"), "entry": ("진입", "P2"),
+         "exit": ("청산", "P2"), "stop": ("손절", "P2"), "error": ("오류", "P2"), "guard": ("가드 차단", "P2"), "reject": ("주문 거부", "P2"),
+         "unknown": ("주문 불명", "P1"), "watchdog": ("워치독 손절", "P1"), "live": ("실매매", "P2"), "eod": ("장 마감 리포트", "P3")}
+
+
+def _v5(r):
+    if r["kind"] == "data_block":          # 하루 수백 건 — 개수만 화면에 요약하고 이벤트 기록에는 넣지 않는다
+        return None
+    name, sev = V5_EV.get(r["kind"], (r["kind"], "P3"))
+    return ("V5", name + (f" · {r['strategy']}" if r.get("strategy") else ""), sev, r["sym"], r["msg"], None)
+
+
+def ingest_v5() -> int:
+    from app.db import q_v5
+    return _ingest_src("v5_events", "select id, at, kind, strategy, sym, left(msg, 600) msg from v5_events where id > %s order by id limit 1000",
+                       _v5, reader=q_v5)
 
 
 def _jones(r):

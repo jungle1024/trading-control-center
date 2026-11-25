@@ -20,7 +20,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 
 from app import assess, db, report, sources, store, tcal
 
-VERSION = "1.2.0"
+VERSION = "2.0.0"
 DASH_PASSWORD = os.environ.get("DASH_PASSWORD", "")
 SESSION_SECRET = os.environ.get("SESSION_SECRET", "tcc-dev-secret")
 INTERVAL = int(os.environ.get("COLLECT_INTERVAL_S", "60"))
@@ -111,6 +111,7 @@ async def collect():
                 return None, f"{type(e).__name__}: {e}"
         (J, ej), (R, er), (K, ek), (M, em) = await asyncio.gather(read(sources.jones, "jones"), read(sources.ross, "ross"),
                                                                    read(sources.kell, "kell"), read(sources.ma, "ma"))
+        V, ev5 = (await read(sources.v5, "v5")) if db.V5_DATABASE_URL else (None, None)
         ma_book = {"paper": "paper", "approve": "live", "auto": "live"}.get(((M or {}).get("settings") or {}).get("mode"))
         acct = {}
         if any(os.environ.get(f"{k}_APP_PASSWORD") for k in ("ROSS", "KELL", "MA")):
@@ -131,13 +132,19 @@ async def collect():
         ar = safe(assess.assess_ross, R, er, "ROSS", acct)
         ak = safe(assess.assess_kell, K, ek, "KELL", acct)
         am = safe(assess.assess_ma, M, em, "MA", acct)
-        risk = assess.assess_risk(aj, ar, ak, am, acct)
-        issues = aj["issues"] + ar["issues"] + ak["issues"] + am["issues"] + risk["issues"]
+        av = safe(assess.assess_v5, V, ev5, "V5", acct) if db.V5_DATABASE_URL else assess.v5_unlinked(health.get("V5"))
+        risk = assess.assess_risk(aj, ar, ak, am, acct, av)
+        issues = aj["issues"] + ar["issues"] + ak["issues"] + am["issues"] + av["issues"] + risk["issues"]
         issues.sort(key=lambda i: (i["severity"], i["app"]))
 
         stored, resolved, ingest = [], [], {}
         try:
             ingest = await asyncio.to_thread(store.ingest)
+            if db.V5_DATABASE_URL:
+                try:
+                    ingest["v5"] = await asyncio.to_thread(store.ingest_v5)
+                except Exception as e:
+                    errs.append(f"ingest v5: {type(e).__name__}: {e}")
             changes = await asyncio.to_thread(store.sync_issues, issues)
             await store.notify(changes)
             stored = await asyncio.to_thread(store.open_issues)
@@ -156,7 +163,7 @@ async def collect():
         snap = {"ready": True, "version": VERSION, "built_at": assess.iso(time.time()), "took_ms": int((time.time() - t0) * 1000),
                 "ctx": ctx.info(), "apps": {k: {**{kk: v for kk, v in a.items() if kk != "url"}, "url": a["url"]} for k, a in sources.APPS.items()},
                 "health": {k: {kk: vv for kk, vv in (v or {}).items() if kk != "body"} | {"body": (v or {}).get("body")} for k, v in health.items()},
-                "jones": aj, "ross": ar, "kell": ak, "ma": am, "risk": risk, "issues": issues,
+                "jones": aj, "ross": ar, "kell": ak, "ma": am, "v5": av, "risk": risk, "issues": issues,
                 "resolved": [{**r, "first_seen": assess.iso(r["first_seen"]), "resolved_at": assess.iso(r["resolved_at"]),
                               "acked_at": assess.iso(r["acked_at"])} for r in resolved],
                 "ingest": ingest, "errors": errs, "ntfy": bool(store.NTFY_TOPIC),

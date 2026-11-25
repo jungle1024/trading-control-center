@@ -856,6 +856,8 @@ def assess_ma(M: dict, h: dict, ctx: Ctx, acct: dict | None) -> dict:
             "watch": [{**w, "for_date": iso(w["for_date"])[:10]} for w in watch], "funnel": funnel, "cum": cum, "day_realized": day_real,
             "unrealized": round(unreal, 2) if live_px else None, "unreal_src": px_src, "positions": plist,
             "report": {"day": iso(mrep.get("day"))[:10] if mrep.get("day") else None, "issues": rep_issues, "perf": mrep.get("perf")} if mrep else None,
+            "improve": {"at": iso((M.get("improve") or {}).get("created")), "status": (M.get("improve") or {}).get("status"),
+                        "n": (M.get("improve") or {}).get("n"), "passed": (M.get("improve") or {}).get("passed")} if M.get("improve") else None,
             "version": {"vid": (M.get("version") or {}).get("vid"), "purpose": (M.get("version") or {}).get("purpose"),
                         "since": iso((M.get("version") or {}).get("activated_at"))}, "targets": M.get("targets"), "account": account, "research": research,
             "loss_limit": {"limit": round(equity * MA_DAY_LOSS, 2) if equity else None, "used_pct": loss_use, "realized": day_real},
@@ -868,10 +870,161 @@ def tm_short(x):
     return datetime.fromtimestamp(t, ET).strftime("%m-%d %H:%M ET") if t else "-"
 
 
-# ───────────────────────── 통합 위험
-def assess_risk(J: dict, R: dict, K: dict, M: dict, acct: dict | None) -> dict:
+# ───────────────────────── V5 통합 자동매매 (A VCP · B 모멘텀 · C 20/60 눌림 — KIS 한 계좌, 전용 DB)
+V5_MODE = {"off": "꺼짐", "sim": "내부 가상", "paper": "KIS 모의투자", "live": "KIS 실매매"}
+V5_STRAT = {"A": "A 미너비니 VCP 수축돌파", "B": "B 로스 카메론 모멘텀(가상 전용)", "C": "C 20/60 눌림목"}
+V5_REGIME = {"BULL": "강세장", "MIXED": "혼조장", "BEAR": "약세장", "PANIC": "급격한 위험장"}
+
+
+def assess_v5(V: dict, h: dict, ctx: Ctx, acct: dict | None) -> dict:
+    app = "V5"
+    url = APPS[app]["url"]
     iss = []
-    pos = (R.get("positions") or []) + (K.get("positions") or []) + (M.get("positions") or []) + ((J or {}).get("positions") or [])
+    st = V.get("settings") or {}
+    modes = st.get("modes") or {}
+    any_live = any(v == "live" for v in modes.values())
+    any_kis = any(v in ("paper", "live") for v in modes.values())
+    mode_name = " · ".join(f"{k} {V5_MODE.get(v, v)}" for k, v in sorted(modes.items())) or "—"
+    capital = (st.get("capital") or {}).get("usd")
+    risk = st.get("risk") or {}
+    b = (h or {}).get("body") or {}
+
+    srv = server_level(app, h)
+    if srv["level"] == "fail":
+        iss.append(issue(app, "P1" if any_live else "P2", "server", "V5 서버 응답 없음", srv["text"]))
+
+    hb = (V.get("heartbeat") or {}).get("engine") or {}
+    hbd = hb.get("data") or {}
+    age = time.time() - _ts(hb["at"]) if hb.get("at") else None
+    # 데이터: 시세 원천(FMP·UW·KIS 웹소켓) 상태와 데이터 차단
+    ev = {r["kind"]: r for r in V.get("ev24") or []}
+    blocks = (ev.get("data_block") or {}).get("n", 0)
+    fmp = hbd.get("fmp") or {}
+    if b and b.get("engine") is False:
+        data = lv("warn", "엔진 꺼짐(ENGINE_ENABLED)")
+    elif fmp.get("errors") or fmp.get("r429"):
+        data = lv("warn", f"FMP 오류 {fmp.get('errors', 0)} · 429 {fmp.get('r429', 0)}" + (f" · {fmp.get('last_err')}" if fmp.get("last_err") else ""))
+    else:
+        data = lv("ok", f"시세 정상 · KIS 웹소켓 {hbd.get('ws') or '—'}" + (f" · 24h 데이터 차단 {blocks}건(오래된 시세 주문 안 함)" if blocks else ""))
+
+    # 분석: 야간 배치(크론 거래일 23:15 UTC) + 60분 여유 → 시장 환경·후보 날짜
+    exp = ctx.last_due(1, 0, 15)
+    reg = V.get("regime") or {}
+    as_of = _d(reg.get("d"))
+    cands = V.get("cands") or []
+    by_s = {}
+    for c in cands:
+        by_s[c["strategy"]] = by_s.get(c["strategy"], 0) + 1
+    if not as_of:
+        ana = lv("fail", "야간 배치 기록 없음")
+    elif as_of >= exp:
+        ana = lv("ok", f"{as_of} 야간 배치 완료 · 시장 {V5_REGIME.get(reg.get('regime'), reg.get('label') or '—')} · 후보 "
+                       + (" · ".join(f"{k} {v}" for k, v in sorted(by_s.items())) or "없음 (조건 충족 종목 없음 — 정상)"))
+    else:
+        ana = lv("warn", f"야간 배치 지연 — 최신 {as_of}, 기대 {exp}")
+        iss.append(issue(app, "P2", f"nightly:{exp}", "V5 야간 배치 지연", f"최신 {as_of} · 기대 {exp}", url + "/#today"))
+
+    # 거래: 엔진 하트비트·주문 상태·보유 손절
+    tr = []
+    if b and b.get("engine") is False:
+        tr.append(lv("warn" if any_kis else "idle", "엔진 꺼짐"))
+    elif age is None or age > 180:
+        lvl = "fail" if ctx.phase in ("pre", "regular") else "warn"
+        tr.append(lv(lvl, "엔진 하트비트 끊김" + (f" — {int(age)}초 전" if age else "")))
+        iss.append(issue(app, "P1" if (any_live and lvl == "fail") else "P2", f"engine:{ctx.today}", "V5 엔진 하트비트 끊김",
+                         f"마지막 {iso(hb.get('at')) or '없음'} · 워치독이 손절을 대신 집행", url + "/#today"))
+    else:
+        tr.append(lv("ok", f"엔진 가동 · {int(age)}초 전 신호 · {hbd.get('phase') or '-'}"))
+    if hbd.get("errors"):
+        tr.append(lv("warn", f"엔진 오류 {len(hbd['errors'])}건: {str(hbd['errors'][-1])[:80]}"))
+    unk = [i for i in V.get("intents") or [] if i["status"] == "UNKNOWN" or
+           (i["status"] in ("SENT", "SENDING") and time.time() - (_ts(i["at"]) or time.time()) > 300)]
+    if unk:
+        tr.append(lv("fail", f"주문 상태 불명 {len(unk)}건"))
+        iss.append(issue(app, "P1", "order_unknown", "V5 주문 상태 불명(대사 필요)",
+                         ", ".join(f"{i['sym']} {i['side']} {i['strategy']}({i['status']})" for i in unk[:5]), url + "/#today"))
+    pos = V.get("positions") or []
+    nostop = [p for p in pos if not p.get("stop")]
+    if nostop:
+        tr.append(lv("fail", f"손절가 없는 보유 {len(nostop)}건"))
+        iss.append(issue(app, "P1" if any(p["mode"] in ("paper", "live") for p in nostop) else "P2", "nostop",
+                         "V5 손절가 없는 포지션", ", ".join(p["sym"] for p in nostop), url + "/#today"))
+    trd = max(tr, key=lambda x: LV_ORDER[x["level"]]) if tr else lv("ok", "정상")
+    stat = {"server": srv, "data": data, "analysis": ana, "trade": trd}
+
+    # 장 마감 리포트 안전장치(11개)
+    rep = V.get("report") or {}
+    checks = rep.get("checks") or {}
+    bad = {k: v for k, v in checks.items() if v not in ("OK",) and not str(v).endswith("건")}
+    for k, v in bad.items():
+        iss.append(issue(app, "P1" if (any_live and k in ("상태 불명 주문 없음", "청산 실패 없음", "손절 감시 공백 없음", "주인 없는 보유 없음")) else "P2",
+                         f"check:{iso(rep.get('d'))[:10]}:{k}", f"V5 안전장치 점검 이상 — {k}", f"{iso(rep.get('d'))[:10]} · {v}", url + "/#today"))
+    al = V.get("alerts24") or {}
+    if al.get("bad"):
+        iss.append(issue(app, "P3", "ntfy_fail", f"V5 휴대폰 알림 발송 실패 {al['bad']}건(24h)"))
+
+    # 성과(청산 완료 · 전략별)
+    trades = V.get("trades") or []
+    def row(t):
+        o, c = _ts(t["opened"]), _ts(t["closed"])
+        return {"pnl": t["pnl"], "r": t["r_mult"], "exit_ts": c, "hold_s": (c - o) if o and c else None}
+    cum = perf([row(t) for t in trades], capital)
+    if cum.get("avg_hold_s") is not None:
+        cum["avg_hold_days"] = round(cum["avg_hold_s"] / 86400, 1)
+    by_strat = {s: perf([row(t) for t in trades if t["strategy"] == s], (capital or 0) * (risk.get("alloc") or {}).get(s, 0) / 100 or None) for s in "ABC"}
+    day = [t for t in trades if t["closed"] and t["closed"].astimezone(ET).date() == ctx.basis]
+    day_real = round(sum(t["pnl"] or 0 for t in day), 2)
+    eq = (V.get("equity") or [None])[0] or {}
+    plist = [{"app": app, "account": "KIS " + V5_MODE.get(p["mode"], p["mode"]) + " (V5)", "symbol": p["sym"], "qty": p["qty"], "entry": p["avg"],
+              "last": None, "stop": p["stop"], "unreal": None,
+              "risk_to_stop": r2((p["avg"] - p["stop"]) * p["qty"]) if p.get("avg") and p.get("stop") else None,
+              "days": (ctx.today - p["opened_at"].astimezone(ET).date()).days if p.get("opened_at") else None,
+              "kind": f"V5 {p['strategy']} {p.get('setup') or ''}".strip(), "protected": bool(p.get("stop")), "status": p.get("state") or "보유"} for p in pos]
+    day_loss_lim = (capital or 0) * (risk.get("day_loss_pct") or 0) / 100
+    loss_use = round(-day_real / day_loss_lim * 100, 1) if (day_loss_lim and day_real < 0) else 0.0
+    if loss_use >= 100:
+        iss.append(issue(app, "P1" if any_live else "P2", f"loss:{ctx.basis}", "V5 하루 손실한도 도달", f"실현 ${day_real} / 한도 ${day_loss_lim:.0f}"))
+    dd = round((eq.get("equity") / eq.get("peak") - 1) * 100, 2) if eq.get("equity") and eq.get("peak") else None
+    if dd is not None and risk.get("max_dd_pct") and -dd >= risk["max_dd_pct"] * 0.8:
+        iss.append(issue(app, "P1" if any_live else "P2", "dd", "V5 계좌 낙폭 한도 접근", f"고점 대비 {dd}% / 한도 −{risk['max_dd_pct']}%"))
+    rv = ((V.get("review") or {}).get("perf") or {}).get("periods") or {}
+    targets = {per: {s: {k: (rv.get(per) or {}).get(s, {}).get(k) for k in ("pct", "target", "achieve", "n")} for s in "ABC"} for per in ("week", "month") if per in rv}
+    ver = V.get("version") or {}
+    return {"app": app, "status": stat, "overall": worst(*stat.values()), "modes": modes, "mode_name": mode_name, "live": any_live, "kis": any_kis,
+            "basis": ctx.basis.isoformat(), "capital": capital, "risk": {k: risk.get(k) for k in ("alloc", "risk_per_trade_pct", "day_loss_pct", "max_dd_pct", "max_symbol_pct")},
+            "regime": {"d": iso(reg.get("d"))[:10] if reg.get("d") else None, "code": reg.get("regime"), "label": reg.get("label"), "why": reg.get("why")},
+            "cand_d": iso(V.get("cand_d"))[:10] if V.get("cand_d") else None, "cands_by": by_s, "cands": cands[:15],
+            "cum": cum, "by_strat": by_strat, "day_realized": day_real, "positions": plist,
+            "equity": {"equity": eq.get("equity"), "peak": eq.get("peak"), "day_pnl": eq.get("day_pnl"), "dd_pct": dd, "d": iso(eq.get("d"))[:10] if eq.get("d") else None},
+            "loss_limit": {"limit": round(day_loss_lim, 2) if day_loss_lim else None, "used_pct": loss_use, "realized": day_real},
+            "report": {"d": iso(rep.get("d"))[:10] if rep.get("d") else None, "final": rep.get("final"), "checks": checks, "bad": list(bad),
+                       "today": rep.get("today")} if rep else None,
+            "engine": {"age": int(age) if age is not None else None, "phase": hbd.get("phase"), "ws": hbd.get("ws"), "cands": hbd.get("cands"),
+                       "positions": hbd.get("positions"), "watchdog_at": iso(((V.get("heartbeat") or {}).get("watchdog") or {}).get("at"))},
+            "data_blocks24": blocks, "nightly_last": iso((V.get("nightly") or {}).get("at")),
+            "version": {"label": ver.get("label"), "since": iso(ver.get("activated_at")), "reason": ver.get("reason")}, "targets": targets,
+            "ntfy": al, "issues": iss, "headline": stat["analysis"]["text"]}
+
+
+def v5_unlinked(h: dict) -> dict:
+    """V5_DATABASE_URL 이 없을 때: 서버 상태만."""
+    srv = server_level("V5", h)
+    b = (h or {}).get("body") or {}
+    st = {"server": srv, "data": lv("warn", "V5 전용 DB 미연결 — V5_DATABASE_URL 입력 필요"),
+          "analysis": lv("warn", "판정 불가(데이터 미연결)"),
+          "trade": lv("ok" if b.get("engine") else "warn", "엔진 " + ("켜짐" if b.get("engine") else "꺼짐·확인 불가") + " (서버 신호만)")}
+    iss = [issue("V5", "P2", "unlinked", "V5 데이터 미연결", "Render 대시보드 서비스 환경변수에 V5_DATABASE_URL(v5-db 외부 접속 URL) 입력 필요")]
+    if srv["level"] == "fail":
+        iss.append(issue("V5", "P2", "server", "V5 서버 응답 없음", srv["text"]))
+    return {"app": "V5", "status": st, "overall": worst(*st.values()), "unlinked": True, "positions": [], "issues": iss,
+            "headline": "데이터 미연결 — 서버 상태만 표시", "mode_name": "—", "cum": {}, "by_strat": {}, "day_realized": None}
+
+
+# ───────────────────────── 통합 위험
+def assess_risk(J: dict, R: dict, K: dict, M: dict, acct: dict | None, V: dict | None = None) -> dict:
+    V = V or {}
+    iss = []
+    pos = (R.get("positions") or []) + (K.get("positions") or []) + (M.get("positions") or []) + ((J or {}).get("positions") or []) + (V.get("positions") or [])
     other = R.get("other_holdings") or []
     syms = {}
     for p in pos + other:
@@ -880,9 +1033,9 @@ def assess_risk(J: dict, R: dict, K: dict, M: dict, acct: dict | None) -> dict:
     if dup:
         iss.append(issue("DASH", "P3", "dup", "여러 계좌 동일 종목 보유", ", ".join(dup)))
     m = (J or {}).get("market") or {}
-    trade_apps = (J, R, K, M)
+    trade_apps = (J, R, K, M, V)
     unknown = sum(1 for x in trade_apps for i in (x.get("issues") or []) if "불명" in i["title"] or "미청산" in i["title"])
-    stale = sum(1 for x in (J, R, K, M) for i in (x.get("issues") or []) if any(w in i["title"] for w in ("지연", "데이터", "미생성")))
+    stale = sum(1 for x in (J, R, K, M, V) for i in (x.get("issues") or []) if any(w in i["title"] for w in ("지연", "데이터", "미생성")))
     risk_to_stop = round(sum(p.get("risk_to_stop") or 0 for p in pos), 2)
     ra, ka, ma = R.get("account") or {}, K.get("account") or {}, M.get("account") or {}
     k_live, m_live = K.get("env") == "live", bool(M.get("live"))
@@ -897,6 +1050,9 @@ def assess_risk(J: dict, R: dict, K: dict, M: dict, acct: dict | None) -> dict:
         {"name": "한국투자 모의투자 (Jones E)" + " · " + (((J or {}).get("etf") or {}).get("mode_name") or "꺼짐"), "live": False,
          "source": "ETF 200일 엔진 예산(모의투자 — 실제 돈 아님)", "capital": ((J or {}).get("etf") or {}).get("budget"), "cash": None,
          "realized_today": ((J or {}).get("etf") or {}).get("day_realized"), "unreal": None, "open": len((J or {}).get("positions") or []), "error": None},
+        {"name": "한국투자 KIS (V5 통합) · " + (V.get("mode_name") or "—"), "live": bool(V.get("live")),
+         "source": "V5 전략 자본(설정)" if not V.get("unlinked") else "데이터 미연결", "capital": V.get("capital"), "cash": None,
+         "realized_today": V.get("day_realized"), "unreal": None, "open": len(V.get("positions") or []), "error": None},
         {"name": "키움증권 (MA20·60)" + ("" if m_live else " · " + (M.get("mode_name") or "")), "live": m_live,
          "source": ma.get("source"), "capital": ma.get("capital_setting"), "cash": ma.get("orderable_usd", ma.get("cash_usd")),
          "realized_today": M.get("day_realized"), "unreal": M.get("unrealized"), "open": len(M.get("positions") or []),
@@ -912,10 +1068,11 @@ def assess_risk(J: dict, R: dict, K: dict, M: dict, acct: dict | None) -> dict:
                          "Render 환경변수 " + " · ".join(f"{k}_APP_PASSWORD" for k in missing) + " 입력 시 실잔고·장중 관리 상태 표시", None))
     return {"accounts": acc_rows, "positions": pos, "other_holdings": other, "duplicates": dup, "total_capital_live": total_cap,
             "realized_today_live": real_today, "unreal_all": unreal_all, "unreal_kell": K.get("unrealized"), "risk_to_stop": risk_to_stop,
-            "loss_limit": R.get("loss_limit"), "ma_loss_limit": M.get("loss_limit"), "trial": R.get("trial"),
+            "loss_limit": R.get("loss_limit"), "ma_loss_limit": M.get("loss_limit"), "v5_loss_limit": V.get("loss_limit"), "trial": R.get("trial"),
             "market": {"stage": m.get("stage"), "name": m.get("name"), "defense": m.get("defense"), "change": m.get("change"),
                        "kell_regime": ((K.get("market") or {}).get("regime")),
-                       "ma_spy": (((M.get("market") or {}).get("SPY")) or {}).get("stage")},
+                       "ma_spy": (((M.get("market") or {}).get("SPY")) or {}).get("stage"),
+                       "v5_regime": (V.get("regime") or {}).get("label")},
             "unknown_orders": unknown, "data_warnings": stale, "issues": iss,
             "note": "통합 대시보드는 조회·경보 전용입니다. 자동매매 중지·청산은 각 전략 서버가 책임집니다."}
 
