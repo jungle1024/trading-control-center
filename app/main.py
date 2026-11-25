@@ -20,10 +20,11 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 
 from app import assess, db, report, sources, store, tcal
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 DASH_PASSWORD = os.environ.get("DASH_PASSWORD", "")
 SESSION_SECRET = os.environ.get("SESSION_SECRET", "tcc-dev-secret")
 INTERVAL = int(os.environ.get("COLLECT_INTERVAL_S", "60"))
+DB_DISK_GB = float(os.environ.get("SHARED_DB_DISK_GB", "15"))  # 공유 DB 저장 용량(Render 설정값)
 UI = Path(__file__).resolve().parent.parent / "ui"
 
 app = FastAPI(title="Global Trading Control Center", docs_url=None, redoc_url=None)
@@ -112,6 +113,7 @@ async def collect():
         (J, ej), (R, er), (K, ek), (M, em) = await asyncio.gather(read(sources.jones, "jones"), read(sources.ross, "ross"),
                                                                    read(sources.kell, "kell"), read(sources.ma, "ma"))
         V, ev5 = (await read(sources.v5, "v5")) if db.V5_DATABASE_URL else (None, None)
+        storage, _ = await read(sources.db_storage, "storage")
         ma_book = {"paper": "paper", "approve": "live", "auto": "live"}.get(((M or {}).get("settings") or {}).get("mode"))
         acct = {}
         if any(os.environ.get(f"{k}_APP_PASSWORD") for k in ("ROSS", "KELL", "MA")):
@@ -135,6 +137,12 @@ async def collect():
         av = safe(assess.assess_v5, V, ev5, "V5", acct) if db.V5_DATABASE_URL else assess.v5_unlinked(health.get("V5"))
         risk = assess.assess_risk(aj, ar, ak, am, acct, av)
         issues = aj["issues"] + ar["issues"] + ak["issues"] + am["issues"] + av["issues"] + risk["issues"]
+        if storage:
+            disk = DB_DISK_GB * 1024 ** 3
+            storage.update(disk=disk, used_pct=round(storage["total"] / disk * 100, 1))
+            if storage["used_pct"] >= 70:
+                issues.append(assess.issue("DASH", "P2" if storage["used_pct"] >= 85 else "P3", "db_storage", "공유 DB 저장 용량 부족 임박",
+                                           f"{storage['total'] / 1024 ** 3:.1f} GB / {DB_DISK_GB} GB ({storage['used_pct']}%) · Ross 오더플로우 1초 기록 {storage['of_sec'] / 1024 ** 2:.0f} MB"))
         issues.sort(key=lambda i: (i["severity"], i["app"]))
 
         stored, resolved, ingest = [], [], {}
@@ -169,7 +177,7 @@ async def collect():
                 "jones": aj, "ross": ar, "kell": ak, "ma": am, "v5": av, "risk": risk, "issues": issues,
                 "resolved": [{**r, "first_seen": assess.iso(r["first_seen"]), "resolved_at": assess.iso(r["resolved_at"]),
                               "acked_at": assess.iso(r["acked_at"])} for r in resolved],
-                "ingest": ingest, "errors": errs, "ntfy": bool(store.NTFY_TOPIC),
+                "ingest": ingest, "errors": errs, "storage": storage, "ntfy": bool(store.NTFY_TOPIC),
                 "accounts_linked": {k: bool(os.environ.get(f"{k}_APP_PASSWORD")) for k in ("ROSS", "KELL", "MA")}}
         SNAP.clear()
         SNAP.update(snap)

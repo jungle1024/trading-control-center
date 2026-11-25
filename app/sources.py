@@ -162,7 +162,7 @@ def jones() -> dict:
 
 def ross() -> dict:
     st = {r["k"]: r["data"] for r in q("""select k, data from rc_settings
-                                         where k in ('autosched','auto','strategy_v1','main','auto_stats')""")}
+                                         where k in ('autosched','auto','strategy_v1','main','auto_stats','strategy_mode','targets')""")}
     trades = q("""select id, et_date, sym, status, updated, data from rc_auto_trades
                   where mode='live' and et_date >= to_char(now() - interval '400 days', 'YYYY-MM-DD') order by et_date, id""")
     reports = q("""select et_date, created, data->'perf' perf, data->'checks' checks, data->'gate' gate, data->'funnel' funnel,
@@ -176,8 +176,28 @@ def ross() -> dict:
     legacy = q("select symbol, name, qty, avg_price from rc_legacy")
     alerts = q("""select count(*) n, count(*) filter (where sent not like 'ntfy:2%%' or coalesce(err,'') <> '') bad
                   from rc_alerts where at > now() - interval '24 hours'""")
+    # V2.0α-L(2026-11-25): 그림자 라인(반대 로직 가상 매매) — 실매매와 분리된 표. 자동 개선 시스템의 목표 진행률.
+    try:
+        shadow = q("""select id, et_date, sym, status, data from rc_shadow_trades
+                       where et_date >= to_char(now() - interval '400 days', 'YYYY-MM-DD') order by et_date, id""")
+    except Exception:
+        shadow = []
+    try:
+        review = q("""select kind, period, created, data->'progress' progress from rc_reviews
+                       where kind in ('daily','weekly','monthly') order by created desc limit 1""")
+    except Exception:
+        review = []
     return {"settings": st, "trades": trades, "reports": reports, "ev_counts": ev_counts, "events": ev, "orders": orders,
-            "longterm": lt, "legacy": legacy, "alerts24": alerts[0] if alerts else {}}
+            "longterm": lt, "legacy": legacy, "alerts24": alerts[0] if alerts else {}, "shadow": shadow, "review": review[0] if review else None}
+
+
+def db_storage() -> dict:
+    """공유 DB 저장 용량 — 큰 테이블과 Ross 오더플로우 1초 기록(rc_of_sec, 30일 보관) 증가 감시."""
+    r = q("""select pg_database_size(current_database()) total,
+                      coalesce((select pg_total_relation_size(c.oid) from pg_class c where c.relname='rc_of_sec'), 0) of_sec""")[0]
+    top = q("""select c.relname, pg_total_relation_size(c.oid) bytes from pg_class c join pg_namespace n on n.oid=c.relnamespace
+                 where c.relkind='r' and n.nspname='public' order by 2 desc limit 6""")
+    return {"total": int(r["total"]), "of_sec": int(r["of_sec"]), "top": [{"table": t["relname"], "bytes": int(t["bytes"])} for t in top]}
 
 
 def kell() -> dict:

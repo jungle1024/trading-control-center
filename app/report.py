@@ -49,7 +49,10 @@ def build(d, snap: dict) -> dict:
              "win_rate": rd.get("win_rate"), "realized": R.get("day_pnl") if R.get("basis") == ds else None,
              "funnel": R.get("funnel"), "unknown_orders": sum(1 for i in issues if i["app"] == "ROSS" and "불명" in i["title"]),
              "cum_n": cum.get("n"), "cum_net": cum.get("net"), "cum_win": cum.get("win_rate"), "loss_limit": R.get("loss_limit"),
-             "checks_bad": [c for c in R.get("checks") or [] if c.get("status") not in ("OK", "해당 없음")]}
+             "checks_bad": [c for c in R.get("checks") or [] if c.get("status") not in ("OK", "해당 없음")],
+             "logic": (R.get("logic") or {}).get("name"),
+             "shadow": {"name": (R.get("shadow") or {}).get("name"), "n": ((R.get("shadow") or {}).get("day") or {}).get("n", 0),
+                        "net": ((R.get("shadow") or {}).get("day") or {}).get("net")} if R.get("shadow") else None}
     sec_k = {"mode": K.get("mode_name"), "holdings": len(K.get("positions") or []), "entries": (K.get("funnel") or {}).get("entries"),
              "realized": K.get("day_realized"), "unrealized": K.get("unrealized"), "watch_live": (K.get("funnel") or {}).get("watch_live"),
              "passed": (K.get("funnel") or {}).get("passed"), "scan_as_of": (K.get("funnel") or {}).get("scan_as_of")}
@@ -85,7 +88,8 @@ def to_text(r: dict) -> str:
     J, Ro, Ke, Ri = r["jones"], r["ross"], r["kell"], r["risk"]
     lines = [f"미국 주식 통합 운영보고서 {r['date']} ({r['status']})",
              f"1) Jones: {v(J['name'])} · 전일 대비 {v(J['change'])} · 경보 {J['warnings']} · 후보 {v(J['candidates'])}(신규 {v(J['new_candidates'])})",
-             f"2) Ross: 청산 {v(Ro['closed'])}건 · 승률 {v(Ro['win_rate'], '{}%', '-')} · 실현 {v(Ro['realized'], '${:+.2f}')} · 미확인 주문 {Ro['unknown_orders']}건",
+             f"2) Ross({Ro.get('logic') or '로스 단타'}): 청산 {v(Ro['closed'])}건 · 승률 {v(Ro['win_rate'], '{}%', '-')} · 실현 {v(Ro['realized'], '${:+.2f}')} · 미확인 주문 {Ro['unknown_orders']}건"
+             + (f" · 그림자({Ro['shadow']['name']}) {Ro['shadow']['n']}건 {v(Ro['shadow']['net'] or 0, '${:+.2f}')}" if Ro.get("shadow") else ""),
              f"3) Kell({Ke['mode']}): 보유 {Ke['holdings']} · 신규 {v(Ke['entries'])} · 실현 {v(Ke['realized'], '${:+.2f}')} · 평가 {v(Ke['unrealized'], '${:+.2f}')}",
              (f"1b) Jones ETF 200일({r['jones_etf']['mode']}): 보유 {r['jones_etf']['holdings']} · 실현 {v(r['jones_etf']['realized'], '${:+.2f}')}"
               + (" · 가상 운용 " + " / ".join(f"{a['name'].split(' ')[0]} {a['ret_pct']:+.2f}%" for a in r['jones_etf']['paper'] if a.get('ret_pct') is not None) if r['jones_etf'].get('paper') else "")

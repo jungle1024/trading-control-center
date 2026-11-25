@@ -131,6 +131,33 @@ def issue(app, sev, key, title, detail="", link=None):
 
 
 # ───────────────────────── 공통: 서버 상태
+ROSS_LOGIC = {"ross": "로스 단타", "integrated": "로스×파비오 통합"}
+RTT_WARN_MS = 1500        # 토스 API 전체 p95 경고 기준
+RTT_ORDER_WARN_MS = 1500  # 주문 API p95 — 넘으면 P2
+
+
+def toss_rtt(t: dict | None) -> dict | None:
+    """Ross /health 의 toss_rtt → 요약. 최근 5분 창이 비면 최근 50건 기준."""
+    if not t:
+        return None
+    w, ln = t.get("window") or {}, t.get("last_n") or {}
+    base = w if w.get("n") else ln
+    order = (t.get("by_kind") or {}).get("order") or {}
+    last = t.get("last") or {}
+    out = {"n": base.get("n") or 0, "basis": "5분" if w.get("n") else f"최근 {ln.get('n') or 0}건",
+           "avg": base.get("avg_ms"), "p95": base.get("p95_ms"), "max": base.get("max_ms"),
+           "order_n": order.get("n") or 0, "order_p95": order.get("p95_ms"), "order_avg": order.get("avg_ms"),
+           "net_errors_5m": t.get("net_errors_5m") or 0, "last_ms": last.get("ms"), "last_age_s": last.get("age_s"), "last_kind": last.get("kind")}
+    if out["n"]:
+        out["short"] = f"평균 {out['avg']:.0f}ms · p95 {out['p95']:.0f}ms"
+        out["text"] = (f"{out['basis']} {out['n']}건 평균 {out['avg']:.0f}ms · p95 {out['p95']:.0f}ms · 최대 {out['max']:.0f}ms"
+                       + (f" · 주문 p95 {out['order_p95']:.0f}ms" if out["order_p95"] else "") + f" · 네트워크 오류 5분 {out['net_errors_5m']}회")
+    else:
+        out["short"] = None
+        out["text"] = "최근 호출 없음" + (f" · 네트워크 오류 5분 {out['net_errors_5m']}회" if out["net_errors_5m"] else "")
+    return out
+
+
 def server_level(app: str, h: dict) -> dict:
     if not h:
         return lv("warn", "점검 전")
@@ -453,8 +480,23 @@ def assess_ross(R: dict, h: dict, ctx: Ctx, acct: dict | None) -> dict:
         tr_lvls.append(lv("warn", f"토스 실시간 {b.get('toss_ws')}"))
     if not b:
         tr_lvls.append(lv("warn", "서버 응답 없음 — 증권사 연결 확인 불가"))
+    # 토스 API 왕복 시간(2026-11-25 /health toss_rtt) — 단타는 주문 지연이 곧 체결가 차이
+    rtt = toss_rtt(b.get("toss_rtt"))
+    in_sess = ctx.session_today and ctx.phase in ("pre", "regular")
+    if rtt and in_sess:
+        if rtt["net_errors_5m"] >= 3:
+            tr_lvls.append(lv("fail", f"토스 연결 오류 5분간 {rtt['net_errors_5m']}회"))
+            iss.append(issue(app, "P2", f"toss_net:{basis}", "Ross 토스 연결 오류 반복", f"최근 5분 네트워크 오류 {rtt['net_errors_5m']}회 · {rtt['text']}", url + "/#auto"))
+        elif (rtt.get("order_p95") or 0) > RTT_ORDER_WARN_MS:
+            tr_lvls.append(lv("warn", f"토스 주문 응답 지연 p95 {rtt['order_p95']:.0f}ms"))
+            iss.append(issue(app, "P2", f"toss_slow_order:{basis}", "Ross 토스 주문 응답 지연",
+                             f"주문 p95 {rtt['order_p95']:.0f}ms (기준 {RTT_ORDER_WARN_MS}ms) · {rtt['text']}", url + "/#auto"))
+        elif (rtt.get("p95") or 0) > RTT_WARN_MS or rtt["net_errors_5m"]:
+            tr_lvls.append(lv("warn", f"토스 응답 지연 · {rtt['text']}"))
+            iss.append(issue(app, "P3", f"toss_slow:{basis}", "Ross 토스 응답 지연", rtt["text"], url + "/#auto"))
     trd = max(tr_lvls, key=lambda x: LV_ORDER[x["level"]]) if tr_lvls else lv(
-        "ok" if b.get("toss") else "warn", "토스증권 연결 · 주문 엔진 " + ("켜짐" if b.get("trading") not in (False, "off") else "꺼짐"))
+        "ok" if b.get("toss") else "warn", "토스증권 연결 · 주문 엔진 " + ("켜짐" if b.get("trading") not in (False, "off") else "꺼짐")
+        + (f" · 응답 {rtt['short']}" if rtt and rtt.get("short") else ""))
     stat = {"server": srv, "data": data, "analysis": ana, "trade": trd}
 
     # 성과
@@ -466,6 +508,24 @@ def assess_ross(R: dict, h: dict, ctx: Ctx, acct: dict | None) -> dict:
     day_closed = [t for t in closed if t["et_date"] == basis]
     day = perf([row(t) for t in day_closed])
     cum = perf([row(t) for t in closed], capital)
+    # 실매매 로직(로스 / 로스×파비오 통합)과 그림자 라인(반대 로직 가상 매매) 비교 — V2.0α-L
+    sm = st.get("strategy_mode") or {}
+    logic = sm.get("mode") or "ross"
+    logic_of = lambda t: (t["data"] or {}).get("strategy_mode") or "ross"
+    by_logic = {lg: {"name": ROSS_LOGIC.get(lg, lg), "day": perf([row(t) for t in day_closed if logic_of(t) == lg]),
+                     "cum": perf([row(t) for t in closed if logic_of(t) == lg], capital)}
+                for lg in sorted({logic_of(t) for t in closed} | {logic})}
+    sh = R.get("shadow") or []
+    sh_closed = [t for t in sh if t["status"] == "closed"]
+    shadow = {"logic": "ross" if logic == "integrated" else "integrated", "open": len([t for t in sh if t["status"] != "closed"]),
+              "day": perf([row(t) for t in sh_closed if t["et_date"] == basis]), "cum": perf([row(t) for t in sh_closed], capital),
+              "since": min((t["et_date"] for t in sh), default=None)}
+    shadow["name"] = ROSS_LOGIC.get(shadow["logic"], shadow["logic"])
+    pg = ((R.get("review") or {}).get("progress")) or {}
+    targets = {k: {kk: (pg.get(k) or {}).get(kk) for kk in ("target_pct", "target_usd", "pnl", "ret_pct", "achv_pct", "gap_usd", "days_left", "need_per_day", "n")}
+               for k in ("week", "month", "year") if pg.get(k)}
+    targets_meta = {"period": (R.get("review") or {}).get("period"), "kind": (R.get("review") or {}).get("kind"),
+                    "at": iso((R.get("review") or {}).get("created")), "base": pg.get("base")} if pg else None
     reports = {r["et_date"]: r for r in R.get("reports") or []}
     rep = reports.get(basis)
     funnel_ev = {"watch": (today_ev.get("watch") or {}).get("syms", 0), "skip": (today_ev.get("skip") or {}).get("n", 0),
@@ -537,6 +597,8 @@ def assess_ross(R: dict, h: dict, ctx: Ctx, acct: dict | None) -> dict:
             "sched": {"enabled": sched.get("enabled"), "start": hm, "entry_window": f"{(params.get('entry_start') or 420) // 60:02d}:{(params.get('entry_start') or 420) % 60:02d}"
                       f"~{(params.get('entry_end') or 690) // 60:02d}:{(params.get('entry_end') or 690) % 60:02d} ET",
                       "max_trades": params.get("max_trades"), "budget": params.get("live_budget_usd")},
+            "logic": {"mode": logic, "name": ROSS_LOGIC.get(logic, logic), "since": iso(sm.get("at"))}, "by_logic": by_logic, "shadow": shadow,
+            "targets": targets, "targets_meta": targets_meta, "toss_rtt": rtt,
             "day": day, "day_pnl": round(day_pnl, 2), "cum": cum, "funnel": funnel, "order_fail_rate": fail_rate, "orders_submitted": n_sub,
             "loss_limit": {"limit": max_loss, "used_pct": loss_use, "realized": round(day_pnl, 2)}, "trial": trial, "gate": gate,
             "report": {"date": basis, "exists": bool(rep), "final": (rep or {}).get("final")}, "checks": checks, "recent": recent,
