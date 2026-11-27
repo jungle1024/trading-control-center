@@ -823,7 +823,10 @@ def assess_ma(M: dict, h: dict, ctx: Ctx, acct: dict | None) -> dict:
         if ctx.phase == "regular" and ctx.min >= 575:
             if bk:
                 last_tick = (bk.get("state") or {}).get("last_tick")
-                age = time.time() - float(last_tick) if last_tick else None
+                # 장부는 5분 캐시(accounts)로 받아 오므로, 경과 시간은 「받아 온 시각 − 마지막 점검」으로 잰다.
+                # 지금 시각으로 재면 캐시가 5분 가까이 묵을 때마다 정상 엔진도 중단 의심으로 떴다가 다음 갱신에 해결되는 오경보가 반복됨.
+                fetched = float(a.get("at") or time.time())
+                age = max(0.0, fetched - float(last_tick)) if last_tick else None
                 if age is None or age > 300:
                     tr.append(lv("fail", "장중 관리 루프 신호 끊김" + (f" — {int(age)}초 전" if age else " — 오늘 기록 없음")))
                     iss.append(issue(app, "P1" if live else "P2", f"engine:{ctx.today}", "MA20·60 장중 관리 중단 의심",
